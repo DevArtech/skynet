@@ -29,8 +29,8 @@ class BeliefTrainConfig:
     policy_loss_weight: float = 1.0
     value_loss_weight: float = 1.0
     reward_loss_weight: float = 1.0
-    winner_loss_weight: float = 0.5
-    rank_loss_weight: float = 0.25
+    winner_loss_weight: float = 0.1
+    rank_loss_weight: float = 0.1
     device: str = "cpu"
 
 

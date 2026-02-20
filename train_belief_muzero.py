@@ -5,8 +5,10 @@ import csv
 import json
 import math
 import random
+import time
 from pathlib import Path
 from statistics import mean
+from typing import Any
 
 import matplotlib
 import torch
@@ -34,6 +36,70 @@ def _ensure_dir(path: Path) -> None:
 
 def _entropy(probs: list[float], eps: float = 1e-12) -> float:
     return -sum(p * math.log(max(p, eps)) for p in probs if p > 0.0)
+
+
+def _compute_calibration_bins(
+    predictions: list[float],
+    outcomes: list[int],
+    num_bins: int = 10,
+) -> list[dict[str, float]]:
+    bins: list[dict[str, float]] = []
+    if not predictions or not outcomes:
+        return bins
+
+    for b in range(num_bins):
+        lo = b / num_bins
+        hi = (b + 1) / num_bins
+        in_bin: list[tuple[float, int]] = []
+        for p, y in zip(predictions, outcomes, strict=False):
+            if b == num_bins - 1:
+                if lo <= p <= hi:
+                    in_bin.append((p, y))
+            elif lo <= p < hi:
+                in_bin.append((p, y))
+
+        count = len(in_bin)
+        if count == 0:
+            bins.append(
+                {
+                    "bin_index": float(b),
+                    "bin_start": float(lo),
+                    "bin_end": float(hi),
+                    "count": 0.0,
+                    "mean_pred": float("nan"),
+                    "empirical_win_rate": float("nan"),
+                    "abs_gap": float("nan"),
+                }
+            )
+            continue
+
+        mean_pred = float(sum(p for p, _ in in_bin) / count)
+        empirical = float(sum(y for _, y in in_bin) / count)
+        bins.append(
+            {
+                "bin_index": float(b),
+                "bin_start": float(lo),
+                "bin_end": float(hi),
+                "count": float(count),
+                "mean_pred": mean_pred,
+                "empirical_win_rate": empirical,
+                "abs_gap": float(abs(empirical - mean_pred)),
+            }
+        )
+    return bins
+
+
+def _compute_ece(calibration_bins: list[dict[str, float]]) -> float:
+    total = sum(int(bin_row["count"]) for bin_row in calibration_bins)
+    if total <= 0:
+        return float("nan")
+    weighted_gap = 0.0
+    for bin_row in calibration_bins:
+        count = int(bin_row["count"])
+        if count <= 0:
+            continue
+        weighted_gap += (count / total) * float(bin_row["abs_gap"])
+    return float(weighted_gap)
 
 
 def _save_metrics(history: dict[str, list[float]], output_dir: Path) -> None:
@@ -80,12 +146,63 @@ def _save_graphs(history: dict[str, list[float]], graph_dir: Path) -> None:
         ("replay_steps", "Replay Steps", "Steps", "diagnostics_replay_steps.png"),
         ("selfplay_policy_entropy", "Self-Play Policy Entropy", "Entropy", "diagnostics_policy_entropy.png"),
         ("selfplay_root_value", "Self-Play Root Value", "Scalar", "diagnostics_root_value.png"),
+        ("eval_mean_return_p0", "Eval Mean Return (P0)", "Return", "testing_eval_mean_return_p0.png"),
         ("eval_win_rate_p0", "Eval Win Rate (P0)", "Win Rate", "testing_eval_win_rate_p0.png"),
         ("eval_mean_episode_length", "Eval Episode Length", "Steps", "testing_eval_episode_length.png"),
+        ("eval_value_brier", "Eval Value Brier Score", "Brier", "testing_eval_value_brier.png"),
+        ("eval_value_ece", "Eval Value ECE (10 bins)", "ECE", "testing_eval_value_ece.png"),
     ]
     for key, title, ylabel, filename in specs:
         if key in history and len(history[key]) == len(x):
             _plot_series(x, history[key], title, ylabel, graph_dir / filename)
+
+
+def _save_calibration(
+    output_dir: Path,
+    iteration: int,
+    calibration_bins: list[dict[str, float]],
+) -> None:
+    calib_dir = output_dir / "calibration"
+    _ensure_dir(calib_dir)
+
+    payload: dict[str, Any] = {"iteration": iteration, "bins": calibration_bins}
+    with (calib_dir / "latest_value_calibration.json").open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    with (calib_dir / f"value_calibration_iter_{iteration}.json").open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    fieldnames = ["bin_index", "bin_start", "bin_end", "count", "mean_pred", "empirical_win_rate", "abs_gap"]
+    with (calib_dir / "latest_value_calibration.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in calibration_bins:
+            writer.writerow(row)
+
+    with (calib_dir / f"value_calibration_iter_{iteration}.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in calibration_bins:
+            writer.writerow(row)
+
+    x = [row["mean_pred"] for row in calibration_bins if math.isfinite(float(row["mean_pred"]))]
+    y = [row["empirical_win_rate"] for row in calibration_bins if math.isfinite(float(row["empirical_win_rate"]))]
+    if not x or not y:
+        return
+
+    plt.figure(figsize=(5, 5))
+    plt.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.25, alpha=0.8, label="Perfect calibration")
+    plt.plot(x, y, marker="o", linewidth=2.0, label="Belief value calibration")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.0)
+    plt.xlabel("Predicted win probability")
+    plt.ylabel("Empirical win rate")
+    plt.title("Belief Value Calibration")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(calib_dir / "latest_value_calibration.png", dpi=140)
+    plt.savefig(calib_dir / f"value_calibration_iter_{iteration}.png", dpi=140)
+    plt.close()
 
 
 def evaluate_belief_model(
@@ -100,6 +217,11 @@ def evaluate_belief_model(
     cfg = MCTSConfig(num_simulations=sims, temperature=1e-8, add_exploration_noise=False, root_exploration_fraction=0.0)
     wins = 0
     lengths: list[int] = []
+    returns: list[float] = []
+    predicted_win_probs: list[float] = []
+    realized_outcomes: list[int] = []
+    eval_start = time.perf_counter()
+    progress_every = max(1, episodes // 4)
 
     for e in range(episodes):
         if env_mode == "decision":
@@ -109,6 +231,8 @@ def evaluate_belief_model(
         obs = env.reset()
         terminated = False
         steps = 0
+        total_reward_p0 = 0.0
+        episode_predictions: list[tuple[int, float]] = []
         while not terminated and steps < max_moves:
             actor = int(env.current_player)
             stats = run_belief_mcts(
@@ -119,14 +243,45 @@ def evaluate_belief_model(
                 config=cfg,
                 device=device,
             )
-            obs, _, terminated, _ = env.step(stats.action)
+            clipped = max(0.0, min(1.0, float(stats.root_value)))
+            episode_predictions.append((actor, clipped))
+            obs, rewards, terminated, _ = env.step(stats.action)
+            total_reward_p0 += float(rewards.get("player_0", 0.0))
             steps += 1
         winner = min(range(env.num_players), key=lambda p: env.scores[p])
         wins += int(winner == 0)
         lengths.append(steps)
+        returns.append(total_reward_p0)
+        for actor, pred in episode_predictions:
+            predicted_win_probs.append(pred)
+            realized_outcomes.append(int(winner == actor))
+        done = e + 1
+        if done % progress_every == 0 or done == episodes:
+            elapsed = time.perf_counter() - eval_start
+            print(
+                f"[eval belief] {done}/{episodes} episodes "
+                f"elapsed={elapsed:.1f}s "
+                f"win_rate_p0={wins / max(1, done):.3f} "
+                f"mean_len={mean(lengths):.1f}"
+            )
+
+    calibration_bins = _compute_calibration_bins(predictions=predicted_win_probs, outcomes=realized_outcomes, num_bins=10)
+    brier = float("nan")
+    if predicted_win_probs and realized_outcomes:
+        brier = float(
+            sum((p - y) ** 2 for p, y in zip(predicted_win_probs, realized_outcomes, strict=False))
+            / len(predicted_win_probs)
+        )
+
     return {
+        "eval_mean_return_p0": float(mean(returns) if returns else 0.0),
         "eval_win_rate_p0": float(wins / max(1, episodes)),
         "eval_mean_episode_length": float(mean(lengths) if lengths else 0.0),
+        "eval_value_brier": brier,
+        "eval_value_ece": _compute_ece(calibration_bins),
+        "eval_value_pred_mean": float(mean(predicted_win_probs) if predicted_win_probs else float("nan")),
+        "eval_value_outcome_mean": float(mean(realized_outcomes) if realized_outcomes else float("nan")),
+        "eval_calibration_bins": calibration_bins,
     }
 
 
@@ -136,17 +291,17 @@ def main() -> None:
     parser.add_argument("--selfplay-episodes-per-iter", type=int, default=4)
     parser.add_argument("--train-steps-per-iter", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=5)
-    parser.add_argument("--eval-episodes", type=int, default=20)
-    parser.add_argument("--selfplay-sims", type=int, default=100)
-    parser.add_argument("--eval-sims", type=int, default=200)
+    parser.add_argument("--eval-episodes", type=int, default=40)
+    parser.add_argument("--selfplay-sims", type=int, default=64)
+    parser.add_argument("--eval-sims", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--unroll-steps", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--max-moves-per-episode", type=int, default=2000)
+    parser.add_argument("--max-moves-per-episode", type=int, default=800)
     parser.add_argument("--replay-capacity-episodes", type=int, default=1000)
-    parser.add_argument("--winner-loss-weight", type=float, default=0.5)
-    parser.add_argument("--rank-loss-weight", type=float, default=0.25)
+    parser.add_argument("--winner-loss-weight", type=float, default=0.1)
+    parser.add_argument("--rank-loss-weight", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=str, default="runs/muzero_belief")
@@ -200,15 +355,21 @@ def main() -> None:
         "replay_steps": [],
         "selfplay_policy_entropy": [],
         "selfplay_root_value": [],
+        "eval_mean_return_p0": [],
         "eval_win_rate_p0": [],
         "eval_mean_episode_length": [],
+        "eval_value_brier": [],
+        "eval_value_ece": [],
+        "eval_value_pred_mean": [],
+        "eval_value_outcome_mean": [],
     }
 
     for iteration in range(1, args.iterations + 1):
         entropy_vals: list[float] = []
         root_vals: list[float] = []
+        selfplay_start = time.perf_counter()
 
-        for _ in range(args.selfplay_episodes_per_iter):
+        for ep_idx in range(args.selfplay_episodes_per_iter):
             ep_seed = random.randint(0, 10_000_000)
             if args.env_mode == "decision":
                 env_factory = lambda s=ep_seed: SkyjoDecisionEnv(num_players=2, seed=s, setup_mode="auto")
@@ -222,6 +383,14 @@ def main() -> None:
                 device=train_cfg.device,
             )
             replay.add_episode(episode)
+            elapsed = time.perf_counter() - selfplay_start
+            print(
+                f"[selfplay belief] iter={iteration:04d} "
+                f"episode={ep_idx + 1}/{args.selfplay_episodes_per_iter} "
+                f"steps={len(episode.steps)} "
+                f"terminated={int(episode.terminated)} "
+                f"elapsed={elapsed:.1f}s"
+            )
             for step in episode.steps:
                 entropy_vals.append(_entropy(step.policy_target))
                 root_vals.append(step.root_value)
@@ -247,8 +416,18 @@ def main() -> None:
             for key in accum:
                 accum[key] /= effective_steps
 
-        eval_metrics = {"eval_win_rate_p0": float("nan"), "eval_mean_episode_length": float("nan")}
+        eval_metrics: dict[str, Any] = {
+            "eval_mean_return_p0": float("nan"),
+            "eval_win_rate_p0": float("nan"),
+            "eval_mean_episode_length": float("nan"),
+            "eval_value_brier": float("nan"),
+            "eval_value_ece": float("nan"),
+            "eval_value_pred_mean": float("nan"),
+            "eval_value_outcome_mean": float("nan"),
+            "eval_calibration_bins": [],
+        }
         if iteration % args.eval_every == 0:
+            print(f"[eval belief] starting iteration {iteration:04d} with {args.eval_episodes} episodes")
             eval_metrics = evaluate_belief_model(
                 model=model,
                 episodes=args.eval_episodes,
@@ -258,6 +437,11 @@ def main() -> None:
                 seed_base=args.seed * 1000 + iteration * 100,
                 env_mode=args.env_mode,
             )
+            _save_calibration(
+                output_dir=output_dir,
+                iteration=iteration,
+                calibration_bins=list(eval_metrics["eval_calibration_bins"]),
+            )
 
         history["iteration"].append(float(iteration))
         for key in ("loss_total", "loss_policy", "loss_value", "loss_reward", "loss_winner", "loss_rank", "grad_norm"):
@@ -265,8 +449,13 @@ def main() -> None:
         history["replay_steps"].append(float(replay.total_steps()))
         history["selfplay_policy_entropy"].append(float(mean(entropy_vals) if entropy_vals else 0.0))
         history["selfplay_root_value"].append(float(mean(root_vals) if root_vals else 0.0))
+        history["eval_mean_return_p0"].append(float(eval_metrics["eval_mean_return_p0"]))
         history["eval_win_rate_p0"].append(float(eval_metrics["eval_win_rate_p0"]))
         history["eval_mean_episode_length"].append(float(eval_metrics["eval_mean_episode_length"]))
+        history["eval_value_brier"].append(float(eval_metrics["eval_value_brier"]))
+        history["eval_value_ece"].append(float(eval_metrics["eval_value_ece"]))
+        history["eval_value_pred_mean"].append(float(eval_metrics["eval_value_pred_mean"]))
+        history["eval_value_outcome_mean"].append(float(eval_metrics["eval_value_outcome_mean"]))
 
         _save_metrics(history, output_dir)
         _save_graphs(history, graph_dir)

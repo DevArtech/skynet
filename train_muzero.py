@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import random
+import time
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -56,6 +57,8 @@ def evaluate_model(
     returns: list[float] = []
     wins = 0
     lengths: list[int] = []
+    eval_start = time.perf_counter()
+    progress_every = max(1, num_episodes // 4)
 
     for ep_idx in range(num_episodes):
         env: Any
@@ -89,6 +92,15 @@ def evaluate_model(
         returns.append(total_reward_p0)
         wins += int(0 in winners)
         lengths.append(step_count)
+        done = ep_idx + 1
+        if done % progress_every == 0 or done == num_episodes:
+            elapsed = time.perf_counter() - eval_start
+            print(
+                f"[eval baseline] {done}/{num_episodes} episodes "
+                f"elapsed={elapsed:.1f}s "
+                f"win_rate_p0={wins / max(1, done):.3f} "
+                f"mean_len={mean(lengths):.1f}"
+            )
 
     return {
         "eval_mean_return_p0": float(mean(returns) if returns else 0.0),
@@ -163,15 +175,15 @@ def main() -> None:
     parser.add_argument("--selfplay-episodes-per-iter", type=int, default=4)
     parser.add_argument("--train-steps-per-iter", type=int, default=8)
     parser.add_argument("--eval-every", type=int, default=5)
-    parser.add_argument("--eval-episodes", type=int, default=20)
-    parser.add_argument("--selfplay-sims", type=int, default=100)
-    parser.add_argument("--eval-sims", type=int, default=200)
+    parser.add_argument("--eval-episodes", type=int, default=40)
+    parser.add_argument("--selfplay-sims", type=int, default=64)
+    parser.add_argument("--eval-sims", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--unroll-steps", type=int, default=5)
     parser.add_argument("--td-steps", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--max-moves-per-episode", type=int, default=2000)
+    parser.add_argument("--max-moves-per-episode", type=int, default=800)
     parser.add_argument("--replay-capacity-episodes", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", type=str, default="cpu")
@@ -234,8 +246,9 @@ def main() -> None:
         terminated_flags: list[float] = []
         policy_entropies: list[float] = []
         root_values: list[float] = []
+        selfplay_start = time.perf_counter()
 
-        for _ in range(args.selfplay_episodes_per_iter):
+        for ep_idx in range(args.selfplay_episodes_per_iter):
             env_seed = random.randint(0, 10_000_000)
             if args.env_mode == "decision":
                 env_factory = lambda s=env_seed: SkyjoDecisionEnv(num_players=2, seed=s, setup_mode="auto")
@@ -249,6 +262,14 @@ def main() -> None:
                 device=train_cfg.device,
             )
             replay.add_episode(episode)
+            elapsed = time.perf_counter() - selfplay_start
+            print(
+                f"[selfplay baseline] iter={iteration:04d} "
+                f"episode={ep_idx + 1}/{args.selfplay_episodes_per_iter} "
+                f"steps={len(episode.steps)} "
+                f"terminated={int(episode.terminated)} "
+                f"elapsed={elapsed:.1f}s"
+            )
             episode_lengths.append(len(episode.steps))
             terminated_flags.append(1.0 if episode.terminated else 0.0)
             for step in episode.steps:
@@ -275,6 +296,7 @@ def main() -> None:
             "eval_mean_episode_length": float("nan"),
         }
         if iteration % args.eval_every == 0:
+            print(f"[eval baseline] starting iteration {iteration:04d} with {args.eval_episodes} episodes")
             eval_metrics = evaluate_model(
                 model=model,
                 num_episodes=args.eval_episodes,
