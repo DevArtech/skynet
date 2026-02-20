@@ -57,6 +57,7 @@ def evaluate_model(
     returns: list[float] = []
     wins = 0
     lengths: list[int] = []
+    truncations = 0
     eval_start = time.perf_counter()
     progress_every = max(1, num_episodes // 4)
 
@@ -84,10 +85,10 @@ def evaluate_model(
             total_reward_p0 += float(rewards.get("player_0", 0.0))
             step_count += 1
 
-        winners: list[int] = []
-        if terminated:
-            min_score = min(env.scores)
-            winners = [i for i, score in enumerate(env.scores) if score == min_score]
+        if not terminated:
+            truncations += 1
+        min_score = min(env.scores)
+        winners = [i for i, score in enumerate(env.scores) if score == min_score]
 
         returns.append(total_reward_p0)
         wins += int(0 in winners)
@@ -106,6 +107,7 @@ def evaluate_model(
         "eval_mean_return_p0": float(mean(returns) if returns else 0.0),
         "eval_win_rate_p0": float(wins / max(1, num_episodes)),
         "eval_mean_episode_length": float(mean(lengths) if lengths else 0.0),
+        "eval_truncation_rate": float(truncations / max(1, num_episodes)),
     }
 
 
@@ -145,6 +147,7 @@ def _save_graphs(history: dict[str, list[float]], graph_dir: Path) -> None:
         ("eval_mean_return_p0", "Eval Mean Return (Player 0)", "Return", "testing_eval_mean_return_p0.png"),
         ("eval_win_rate_p0", "Eval Win Rate (Player 0)", "Win Rate", "testing_eval_win_rate_p0.png"),
         ("eval_mean_episode_length", "Eval Episode Length", "Steps", "testing_eval_episode_length.png"),
+        ("eval_truncation_rate", "Eval Truncation Rate", "Rate", "testing_eval_truncation_rate.png"),
     ]
 
     for key, title, y_label, filename in graph_specs:
@@ -239,6 +242,7 @@ def main() -> None:
         "eval_mean_return_p0": [],
         "eval_win_rate_p0": [],
         "eval_mean_episode_length": [],
+        "eval_truncation_rate": [],
     }
 
     for iteration in range(1, args.iterations + 1):
@@ -294,6 +298,7 @@ def main() -> None:
             "eval_mean_return_p0": float("nan"),
             "eval_win_rate_p0": float("nan"),
             "eval_mean_episode_length": float("nan"),
+            "eval_truncation_rate": float("nan"),
         }
         if iteration % args.eval_every == 0:
             print(f"[eval baseline] starting iteration {iteration:04d} with {args.eval_episodes} episodes")
@@ -321,6 +326,7 @@ def main() -> None:
         history["eval_mean_return_p0"].append(float(eval_metrics["eval_mean_return_p0"]))
         history["eval_win_rate_p0"].append(float(eval_metrics["eval_win_rate_p0"]))
         history["eval_mean_episode_length"].append(float(eval_metrics["eval_mean_episode_length"]))
+        history["eval_truncation_rate"].append(float(eval_metrics["eval_truncation_rate"]))
 
         _save_metrics(history, output_dir=output_dir)
         _save_graphs(history, graph_dir=graph_dir)

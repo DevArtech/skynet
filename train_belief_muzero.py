@@ -149,6 +149,7 @@ def _save_graphs(history: dict[str, list[float]], graph_dir: Path) -> None:
         ("eval_mean_return_p0", "Eval Mean Return (P0)", "Return", "testing_eval_mean_return_p0.png"),
         ("eval_win_rate_p0", "Eval Win Rate (P0)", "Win Rate", "testing_eval_win_rate_p0.png"),
         ("eval_mean_episode_length", "Eval Episode Length", "Steps", "testing_eval_episode_length.png"),
+        ("eval_truncation_rate", "Eval Truncation Rate", "Rate", "testing_eval_truncation_rate.png"),
         ("eval_value_brier", "Eval Value Brier Score", "Brier", "testing_eval_value_brier.png"),
         ("eval_value_ece", "Eval Value ECE (10 bins)", "ECE", "testing_eval_value_ece.png"),
     ]
@@ -217,6 +218,7 @@ def evaluate_belief_model(
     cfg = MCTSConfig(num_simulations=sims, temperature=1e-8, add_exploration_noise=False, root_exploration_fraction=0.0)
     wins = 0
     lengths: list[int] = []
+    truncations = 0
     returns: list[float] = []
     predicted_win_probs: list[float] = []
     realized_outcomes: list[int] = []
@@ -248,6 +250,8 @@ def evaluate_belief_model(
             obs, rewards, terminated, _ = env.step(stats.action)
             total_reward_p0 += float(rewards.get("player_0", 0.0))
             steps += 1
+        if not terminated:
+            truncations += 1
         winner = min(range(env.num_players), key=lambda p: env.scores[p])
         wins += int(winner == 0)
         lengths.append(steps)
@@ -277,6 +281,7 @@ def evaluate_belief_model(
         "eval_mean_return_p0": float(mean(returns) if returns else 0.0),
         "eval_win_rate_p0": float(wins / max(1, episodes)),
         "eval_mean_episode_length": float(mean(lengths) if lengths else 0.0),
+        "eval_truncation_rate": float(truncations / max(1, episodes)),
         "eval_value_brier": brier,
         "eval_value_ece": _compute_ece(calibration_bins),
         "eval_value_pred_mean": float(mean(predicted_win_probs) if predicted_win_probs else float("nan")),
@@ -358,6 +363,7 @@ def main() -> None:
         "eval_mean_return_p0": [],
         "eval_win_rate_p0": [],
         "eval_mean_episode_length": [],
+        "eval_truncation_rate": [],
         "eval_value_brier": [],
         "eval_value_ece": [],
         "eval_value_pred_mean": [],
@@ -420,6 +426,7 @@ def main() -> None:
             "eval_mean_return_p0": float("nan"),
             "eval_win_rate_p0": float("nan"),
             "eval_mean_episode_length": float("nan"),
+            "eval_truncation_rate": float("nan"),
             "eval_value_brier": float("nan"),
             "eval_value_ece": float("nan"),
             "eval_value_pred_mean": float("nan"),
@@ -452,6 +459,7 @@ def main() -> None:
         history["eval_mean_return_p0"].append(float(eval_metrics["eval_mean_return_p0"]))
         history["eval_win_rate_p0"].append(float(eval_metrics["eval_win_rate_p0"]))
         history["eval_mean_episode_length"].append(float(eval_metrics["eval_mean_episode_length"]))
+        history["eval_truncation_rate"].append(float(eval_metrics["eval_truncation_rate"]))
         history["eval_value_brier"].append(float(eval_metrics["eval_value_brier"]))
         history["eval_value_ece"].append(float(eval_metrics["eval_value_ece"]))
         history["eval_value_pred_mean"].append(float(eval_metrics["eval_value_pred_mean"]))
