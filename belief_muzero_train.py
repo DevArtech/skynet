@@ -31,6 +31,8 @@ class BeliefTrainConfig:
     reward_loss_weight: float = 1.0
     winner_loss_weight: float = 0.1
     rank_loss_weight: float = 0.1
+    time_penalty_per_step: float = 0.0002
+    time_penalty_max_per_episode: float | None = 0.05
     device: str = "cpu"
 
 
@@ -160,9 +162,13 @@ class BeliefReplayBuffer:
 def generate_belief_self_play_episode(
     model: BeliefAwareMuZeroNet,
     mcts_config: MCTSConfig,
+    opponent_model: BeliefAwareMuZeroNet | None = None,
+    learner_player_id: int = 0,
     env_factory: Callable[[], Any] | None = None,
     max_moves: int = 2000,
     device: str = "cpu",
+    time_penalty_per_step: float = 0.0,
+    time_penalty_max_per_episode: float | None = None,
 ) -> BeliefEpisodeRecord:
     if env_factory is None:
         env_factory = lambda: SkyjoEnv(num_players=2, seed=random.randint(0, 10_000_000), setup_mode="auto")
@@ -173,12 +179,16 @@ def generate_belief_self_play_episode(
     pending_steps: list[dict[str, Any]] = []
     terminated = False
     moves = 0
+    penalty_accum = 0.0
 
     while not terminated and moves < max_moves:
         actor = int(env.current_player)
         legal = env.legal_actions()
+        acting_model = model
+        if opponent_model is not None and actor != int(learner_player_id):
+            acting_model = opponent_model
         stats = run_belief_mcts(
-            model=model,
+            model=acting_model,
             observation=obs,
             legal_action_ids=legal,
             ego_player_id=actor,
@@ -186,11 +196,15 @@ def generate_belief_self_play_episode(
             device=device,
         )
         next_obs, rewards, terminated, _ = env.step(stats.action)
+        penalty = float(time_penalty_per_step)
+        if time_penalty_max_per_episode is not None and time_penalty_max_per_episode >= 0.0:
+            penalty = min(penalty, max(0.0, float(time_penalty_max_per_episode) - penalty_accum))
+        penalty_accum += penalty
         pending_steps.append(
             {
                 "observation": copy.deepcopy(obs),
                 "action": int(stats.action),
-                "reward": float(rewards.get(f"player_{actor}", 0.0)),
+                "reward": float(rewards.get(f"player_{actor}", 0.0)) - penalty,
                 "policy_target": _policy_dict_to_vector(stats.policy_target, action_space_size),
                 "root_value": float(stats.root_value),
                 "current_player_id": actor,

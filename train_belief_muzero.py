@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
 import random
 import time
+from dataclasses import replace
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -36,6 +38,145 @@ def _ensure_dir(path: Path) -> None:
 
 def _entropy(probs: list[float], eps: float = 1e-12) -> float:
     return -sum(p * math.log(max(p, eps)) for p in probs if p > 0.0)
+
+
+def _piecewise_constant_schedule(
+    iteration: int,
+    initial_value: int,
+    mid_value: int,
+    final_value: int,
+    mid_start_iter: int,
+    final_start_iter: int,
+) -> int:
+    if iteration >= final_start_iter:
+        return int(final_value)
+    if iteration >= mid_start_iter:
+        return int(mid_value)
+    return int(initial_value)
+
+
+def _select_dirichlet_params(
+    iteration: int,
+    warmup_iters: int,
+    alpha_initial: float,
+    frac_initial: float,
+    alpha_late: float,
+    frac_late: float,
+) -> tuple[float, float]:
+    if iteration <= warmup_iters:
+        return float(alpha_initial), float(frac_initial)
+    return float(alpha_late), float(frac_late)
+
+
+def _linear_ramp(
+    iteration: int,
+    start_iter: int,
+    end_iter: int,
+    start_value: float,
+    end_value: float,
+) -> float:
+    if iteration <= start_iter:
+        return float(start_value)
+    if iteration >= end_iter:
+        return float(end_value)
+    span = max(1, end_iter - start_iter)
+    t = (iteration - start_iter) / span
+    return float(start_value + t * (end_value - start_value))
+
+
+def _checkpoint_iter(path: Path) -> int:
+    name = path.stem
+    if not name.startswith("checkpoint_iter_"):
+        return -1
+    suffix = name.replace("checkpoint_iter_", "", 1)
+    try:
+        return int(suffix)
+    except ValueError:
+        return -1
+
+
+def _find_latest_checkpoint(checkpoint_dir: Path) -> Path | None:
+    candidates = [p for p in checkpoint_dir.glob("checkpoint_iter_*.pt") if p.is_file()]
+    if not candidates:
+        return None
+    candidates.sort(key=_checkpoint_iter)
+    return candidates[-1]
+
+
+def _build_history_template() -> dict[str, list[float]]:
+    return {
+        "iteration": [],
+        "loss_total": [],
+        "loss_policy": [],
+        "loss_value": [],
+        "loss_reward": [],
+        "loss_winner": [],
+        "loss_rank": [],
+        "grad_norm": [],
+        "replay_steps": [],
+        "selfplay_policy_entropy": [],
+        "selfplay_root_value": [],
+        "selfplay_num_simulations": [],
+        "selfplay_root_dirichlet_alpha": [],
+        "selfplay_root_exploration_fraction": [],
+        "winner_loss_weight": [],
+        "rank_loss_weight": [],
+        "eval_mean_return_p0": [],
+        "eval_win_rate_p0": [],
+        "eval_mean_episode_length": [],
+        "eval_truncation_rate": [],
+        "eval_value_brier": [],
+        "eval_value_ece": [],
+        "eval_value_pred_mean": [],
+        "eval_value_outcome_mean": [],
+    }
+
+
+def _load_history(history_path: Path, template: dict[str, list[float]]) -> dict[str, list[float]]:
+    if not history_path.exists():
+        return {k: list(v) for k, v in template.items()}
+    with history_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+    loaded: dict[str, list[float]] = {k: [] for k in template}
+    for key in template:
+        values = payload.get(key, [])
+        if isinstance(values, list):
+            loaded[key] = [float(v) for v in values]
+    return loaded
+
+
+def _trim_history(history: dict[str, list[float]], target_rows: int) -> None:
+    target = max(0, int(target_rows))
+    for key, values in history.items():
+        if len(values) > target:
+            history[key] = values[:target]
+    row_count = len(history["iteration"])
+    for key, values in history.items():
+        if key == "iteration":
+            continue
+        if len(values) < row_count:
+            history[key].extend([float("nan")] * (row_count - len(values)))
+
+
+def _rebuild_opponent_pool(
+    checkpoint_dir: Path,
+    max_pool_size: int,
+    up_to_iteration: int,
+    device: str,
+) -> list[dict[str, torch.Tensor]]:
+    if max_pool_size <= 0:
+        return []
+    checkpoints = [p for p in checkpoint_dir.glob("checkpoint_iter_*.pt") if p.is_file()]
+    checkpoints = [p for p in checkpoints if 0 < _checkpoint_iter(p) <= up_to_iteration]
+    checkpoints.sort(key=_checkpoint_iter)
+    checkpoints = checkpoints[-max_pool_size:]
+    pool: list[dict[str, torch.Tensor]] = []
+    for path in checkpoints:
+        payload = torch.load(path, map_location=torch.device(device))
+        model_state = payload.get("model_state_dict")
+        if isinstance(model_state, dict):
+            pool.append(copy.deepcopy(model_state))
+    return pool
 
 
 def _compute_calibration_bins(
@@ -235,7 +376,7 @@ def evaluate_belief_model(
         steps = 0
         total_reward_p0 = 0.0
         episode_predictions: list[tuple[int, float]] = []
-        while not terminated and steps < max_moves:
+        while not terminated and (max_moves <= 0 or steps < max_moves):
             actor = int(env.current_player)
             stats = run_belief_mcts(
                 model=model,
@@ -292,21 +433,58 @@ def evaluate_belief_model(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train belief-aware MuZero and save diagnostics plots.")
-    parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--selfplay-episodes-per-iter", type=int, default=4)
-    parser.add_argument("--train-steps-per-iter", type=int, default=8)
-    parser.add_argument("--eval-every", type=int, default=5)
-    parser.add_argument("--eval-episodes", type=int, default=40)
-    parser.add_argument("--selfplay-sims", type=int, default=64)
-    parser.add_argument("--eval-sims", type=int, default=64)
+    parser.add_argument("--iterations", type=int, default=2000)
+    parser.add_argument("--selfplay-episodes-per-iter", type=int, default=32)
+    parser.add_argument("--train-steps-per-iter", type=int, default=64)
+    parser.add_argument("--eval-every", type=int, default=20)
+    parser.add_argument("--eval-episodes", type=int, default=200)
+    parser.add_argument("--selfplay-sims", type=int, default=50)
+    parser.add_argument("--selfplay-sims-mid", type=int, default=100)
+    parser.add_argument("--selfplay-sims-final", type=int, default=200)
+    parser.add_argument("--selfplay-sims-mid-iter", type=int, default=200)
+    parser.add_argument("--selfplay-sims-final-iter", type=int, default=500)
+    parser.add_argument("--eval-sims", type=int, default=100)
+    parser.add_argument("--dirichlet-alpha-initial", type=float, default=0.3)
+    parser.add_argument("--dirichlet-frac-initial", type=float, default=0.25)
+    parser.add_argument("--dirichlet-alpha-late", type=float, default=0.15)
+    parser.add_argument("--dirichlet-frac-late", type=float, default=0.10)
+    parser.add_argument("--dirichlet-switch-iter", type=int, default=200)
+    parser.add_argument("--opponent-pool-size", type=int, default=10)
+    parser.add_argument("--opponent-latest-prob", type=float, default=0.7)
+    parser.add_argument("--opponent-snapshot-every", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--unroll-steps", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--max-moves-per-episode", type=int, default=800)
-    parser.add_argument("--replay-capacity-episodes", type=int, default=1000)
-    parser.add_argument("--winner-loss-weight", type=float, default=0.1)
-    parser.add_argument("--rank-loss-weight", type=float, default=0.1)
+    parser.add_argument(
+        "--time-penalty-per-step",
+        type=float,
+        default=0.0002,
+        help="Subtract this amount from the acting player's reward every step to encourage shorter games.",
+    )
+    parser.add_argument(
+        "--time-penalty-max-per-episode",
+        type=float,
+        default=0.05,
+        help="Cap the cumulative time penalty applied over one episode. Use <0 to disable cap.",
+    )
+    parser.add_argument("--max-moves-per-episode", type=int, default=2000)
+    parser.add_argument(
+        "--eval-max-moves",
+        type=int,
+        default=2000,
+        help="Max moves during evaluation only. Use <=0 for no cap.",
+    )
+    parser.add_argument("--replay-capacity-episodes", type=int, default=5000)
+    parser.add_argument("--winner-loss-weight-initial", type=float, default=0.1)
+    parser.add_argument("--rank-loss-weight-initial", type=float, default=0.05)
+    parser.add_argument("--winner-loss-weight", type=float, default=0.5)
+    parser.add_argument("--rank-loss-weight", type=float, default=0.25)
+    parser.add_argument("--aux-loss-ramp-start-iter", type=int, default=200)
+    parser.add_argument("--aux-loss-ramp-end-iter", type=int, default=500)
+    parser.add_argument("--checkpoint-every", type=int, default=1)
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output dir.")
+    parser.add_argument("--resume-checkpoint", type=str, default="", help="Resume from an explicit checkpoint file path.")
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=str, default="runs/muzero_belief")
@@ -338,39 +516,96 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        time_penalty_per_step=args.time_penalty_per_step,
+        time_penalty_max_per_episode=(
+            None if args.time_penalty_max_per_episode < 0.0 else args.time_penalty_max_per_episode
+        ),
         max_moves_per_episode=args.max_moves_per_episode,
         replay_capacity_episodes=args.replay_capacity_episodes,
-        winner_loss_weight=args.winner_loss_weight,
-        rank_loss_weight=args.rank_loss_weight,
+        winner_loss_weight=args.winner_loss_weight_initial,
+        rank_loss_weight=args.rank_loss_weight_initial,
         device=args.device,
     )
     optimizer = create_belief_optimizer(model, train_cfg)
     replay = BeliefReplayBuffer(capacity_episodes=train_cfg.replay_capacity_episodes)
-    selfplay_cfg = MCTSConfig(num_simulations=args.selfplay_sims, temperature=1.0, add_exploration_noise=True)
+    opponent_model = BeliefAwareMuZeroNet(build_default_belief_muzero_config(action_space_size=action_space_size)).to(
+        torch.device(args.device)
+    )
+    opponent_model.eval()
+    opponent_pool: list[dict[str, torch.Tensor]] = []
 
-    history: dict[str, list[float]] = {
-        "iteration": [],
-        "loss_total": [],
-        "loss_policy": [],
-        "loss_value": [],
-        "loss_reward": [],
-        "loss_winner": [],
-        "loss_rank": [],
-        "grad_norm": [],
-        "replay_steps": [],
-        "selfplay_policy_entropy": [],
-        "selfplay_root_value": [],
-        "eval_mean_return_p0": [],
-        "eval_win_rate_p0": [],
-        "eval_mean_episode_length": [],
-        "eval_truncation_rate": [],
-        "eval_value_brier": [],
-        "eval_value_ece": [],
-        "eval_value_pred_mean": [],
-        "eval_value_outcome_mean": [],
-    }
+    history_template = _build_history_template()
+    history = {k: list(v) for k, v in history_template.items()}
+    start_iteration = 1
+    if args.resume or args.resume_checkpoint:
+        checkpoint_path = Path(args.resume_checkpoint) if args.resume_checkpoint else _find_latest_checkpoint(checkpoint_dir)
+        if checkpoint_path is None or not checkpoint_path.exists():
+            raise FileNotFoundError("Resume requested but no checkpoint found.")
+        payload = torch.load(checkpoint_path, map_location=torch.device(args.device))
+        model.load_state_dict(payload["model_state_dict"])
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+        completed_iter = int(payload.get("iteration", 0))
+        start_iteration = completed_iter + 1
+        history = _load_history(output_dir / "metrics_history.json", template=history_template)
+        _trim_history(history, target_rows=completed_iter)
+        opponent_pool = _rebuild_opponent_pool(
+            checkpoint_dir=checkpoint_dir,
+            max_pool_size=args.opponent_pool_size,
+            up_to_iteration=completed_iter,
+            device=args.device,
+        )
+        print(f"[resume belief] loaded checkpoint={checkpoint_path} completed_iter={completed_iter}")
 
-    for iteration in range(1, args.iterations + 1):
+    if start_iteration > args.iterations:
+        print(
+            f"[resume belief] nothing to do: completed_iter={start_iteration - 1} "
+            f">= target_iterations={args.iterations}"
+        )
+        return
+
+    for iteration in range(start_iteration, args.iterations + 1):
+        selfplay_sims = _piecewise_constant_schedule(
+            iteration=iteration,
+            initial_value=args.selfplay_sims,
+            mid_value=args.selfplay_sims_mid,
+            final_value=args.selfplay_sims_final,
+            mid_start_iter=args.selfplay_sims_mid_iter,
+            final_start_iter=args.selfplay_sims_final_iter,
+        )
+        dirichlet_alpha, dirichlet_frac = _select_dirichlet_params(
+            iteration=iteration,
+            warmup_iters=args.dirichlet_switch_iter,
+            alpha_initial=args.dirichlet_alpha_initial,
+            frac_initial=args.dirichlet_frac_initial,
+            alpha_late=args.dirichlet_alpha_late,
+            frac_late=args.dirichlet_frac_late,
+        )
+        selfplay_cfg = MCTSConfig(
+            num_simulations=selfplay_sims,
+            temperature=1.0,
+            add_exploration_noise=True,
+            root_dirichlet_alpha=dirichlet_alpha,
+            root_exploration_fraction=dirichlet_frac,
+        )
+        winner_loss_weight = _linear_ramp(
+            iteration=iteration,
+            start_iter=args.aux_loss_ramp_start_iter,
+            end_iter=args.aux_loss_ramp_end_iter,
+            start_value=args.winner_loss_weight_initial,
+            end_value=args.winner_loss_weight,
+        )
+        rank_loss_weight = _linear_ramp(
+            iteration=iteration,
+            start_iter=args.aux_loss_ramp_start_iter,
+            end_iter=args.aux_loss_ramp_end_iter,
+            start_value=args.rank_loss_weight_initial,
+            end_value=args.rank_loss_weight,
+        )
+        iter_train_cfg = replace(
+            train_cfg,
+            winner_loss_weight=winner_loss_weight,
+            rank_loss_weight=rank_loss_weight,
+        )
         entropy_vals: list[float] = []
         root_vals: list[float] = []
         selfplay_start = time.perf_counter()
@@ -381,12 +616,26 @@ def main() -> None:
                 env_factory = lambda s=ep_seed: SkyjoDecisionEnv(num_players=2, seed=s, setup_mode="auto")
             else:
                 env_factory = lambda s=ep_seed: SkyjoEnv(num_players=2, seed=s, setup_mode="auto")
+
+            selected_opponent: BeliefAwareMuZeroNet | None = None
+            if args.opponent_pool_size > 0 and opponent_pool:
+                use_latest = random.random() < max(0.0, min(1.0, args.opponent_latest_prob))
+                if not use_latest:
+                    snapshot = random.choice(opponent_pool)
+                    opponent_model.load_state_dict(snapshot)
+                    selected_opponent = opponent_model
+
+            learner_player_id = random.randint(0, 1)
             episode = generate_belief_self_play_episode(
                 model=model,
                 mcts_config=selfplay_cfg,
+                opponent_model=selected_opponent,
+                learner_player_id=learner_player_id,
                 env_factory=env_factory,
                 max_moves=train_cfg.max_moves_per_episode,
                 device=train_cfg.device,
+                time_penalty_per_step=train_cfg.time_penalty_per_step,
+                time_penalty_max_per_episode=train_cfg.time_penalty_max_per_episode,
             )
             replay.add_episode(episode)
             elapsed = time.perf_counter() - selfplay_start
@@ -412,9 +661,9 @@ def main() -> None:
         }
         effective_steps = 0
         for _ in range(args.train_steps_per_iter):
-            if replay.total_steps() < train_cfg.batch_size:
+            if replay.total_steps() < iter_train_cfg.batch_size:
                 break
-            losses = train_belief_step(model=model, optimizer=optimizer, replay_buffer=replay, config=train_cfg)
+            losses = train_belief_step(model=model, optimizer=optimizer, replay_buffer=replay, config=iter_train_cfg)
             for key in accum:
                 accum[key] += losses[key]
             effective_steps += 1
@@ -439,7 +688,7 @@ def main() -> None:
                 model=model,
                 episodes=args.eval_episodes,
                 sims=args.eval_sims,
-                max_moves=args.max_moves_per_episode,
+                max_moves=args.eval_max_moves,
                 device=args.device,
                 seed_base=args.seed * 1000 + iteration * 100,
                 env_mode=args.env_mode,
@@ -456,6 +705,11 @@ def main() -> None:
         history["replay_steps"].append(float(replay.total_steps()))
         history["selfplay_policy_entropy"].append(float(mean(entropy_vals) if entropy_vals else 0.0))
         history["selfplay_root_value"].append(float(mean(root_vals) if root_vals else 0.0))
+        history["selfplay_num_simulations"].append(float(selfplay_sims))
+        history["selfplay_root_dirichlet_alpha"].append(float(dirichlet_alpha))
+        history["selfplay_root_exploration_fraction"].append(float(dirichlet_frac))
+        history["winner_loss_weight"].append(float(winner_loss_weight))
+        history["rank_loss_weight"].append(float(rank_loss_weight))
         history["eval_mean_return_p0"].append(float(eval_metrics["eval_mean_return_p0"]))
         history["eval_win_rate_p0"].append(float(eval_metrics["eval_win_rate_p0"]))
         history["eval_mean_episode_length"].append(float(eval_metrics["eval_mean_episode_length"]))
@@ -468,7 +722,7 @@ def main() -> None:
         _save_metrics(history, output_dir)
         _save_graphs(history, graph_dir)
 
-        if iteration % args.eval_every == 0 or iteration == args.iterations:
+        if iteration % max(1, args.checkpoint_every) == 0 or iteration == args.iterations:
             torch.save(
                 {
                     "iteration": iteration,
@@ -478,11 +732,17 @@ def main() -> None:
                 },
                 checkpoint_dir / f"checkpoint_iter_{iteration}.pt",
             )
+        if args.opponent_pool_size > 0 and iteration % max(1, args.opponent_snapshot_every) == 0:
+            opponent_pool.append(copy.deepcopy(model.state_dict()))
+            if len(opponent_pool) > args.opponent_pool_size:
+                opponent_pool = opponent_pool[-args.opponent_pool_size :]
 
         print(
             f"[iter {iteration:04d}] "
             f"loss={accum['loss_total']:.4f} "
             f"winner_loss={accum['loss_winner']:.4f} "
+            f"selfplay_sims={selfplay_sims} "
+            f"pool={len(opponent_pool)} "
             f"eval_win_rate={eval_metrics['eval_win_rate_p0']}"
         )
 

@@ -176,6 +176,21 @@ def _policy_from_visits(visit_counts: dict[int, int], temperature: float) -> dic
     return {a: float(p.item()) for a, p in zip(visit_counts.keys(), values, strict=False)}
 
 
+def _select_action_from_policy(policy_target: dict[int, float], temperature: float) -> int:
+    if not policy_target:
+        raise ValueError("Cannot select an action from an empty policy.")
+    if temperature <= 1e-8:
+        return max(policy_target, key=policy_target.get)
+    actions = list(policy_target.keys())
+    probs = torch.tensor([max(0.0, float(policy_target[a])) for a in actions], dtype=torch.float32)
+    total = float(probs.sum().item())
+    if total <= 0.0:
+        return actions[0]
+    probs = probs / total
+    sampled_idx = int(torch.multinomial(probs, num_samples=1).item())
+    return actions[sampled_idx]
+
+
 def run_mcts(
     model: MuZeroNet,
     observation: dict[str, Any],
@@ -226,7 +241,7 @@ def run_mcts(
     visit_counts = {action: child.visit_count for action, child in root.children.items()}
     q_values = {action: child.value() for action, child in root.children.items()}
     policy_target = _policy_from_visits(visit_counts, cfg.temperature)
-    selected_action = max(policy_target, key=policy_target.get)
+    selected_action = _select_action_from_policy(policy_target, cfg.temperature)
 
     return SearchStats(
         action=selected_action,

@@ -2,9 +2,9 @@
 #SBATCH --job-name=muzero_baseline
 #SBATCH --partition=dgxh100
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-gpu=8
-#SBATCH --mem=128G
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-gpu=16
+#SBATCH --mem=256G
+#SBATCH --time=1-00:00:00
 #SBATCH --output=runs/muzero_baseline/muzero_baseline_%j.out
 #SBATCH --error=runs/muzero_baseline/muzero_baseline_%j.err
 
@@ -31,13 +31,46 @@ SELFPLAY_EPISODES_PER_ITER=${SELFPLAY_EPISODES_PER_ITER:-8}
 SELFPLAY_SIMS=${SELFPLAY_SIMS:-64}
 EVAL_SIMS=${EVAL_SIMS:-64}
 MAX_MOVES_PER_EPISODE=${MAX_MOVES_PER_EPISODE:-800}
+DISCOUNT=${DISCOUNT:-0.997}
+TRUNCATION_PENALTY=${TRUNCATION_PENALTY:-1.0}
+TIME_PENALTY_MAX_PER_EPISODE=${TIME_PENALTY_MAX_PER_EPISODE:--1}
+RESUME=${RESUME:-0}
+RESUME_CHECKPOINT=${RESUME_CHECKPOINT:-}
 
-"$PYTHON_BIN" -u train_muzero.py \
-  --device cuda \
-  --eval-episodes "$EVAL_EPISODES" \
-  --eval-sims "$EVAL_SIMS" \
-  --selfplay-episodes-per-iter "$SELFPLAY_EPISODES_PER_ITER" \
-  --selfplay-sims "$SELFPLAY_SIMS" \
-  --max-moves-per-episode "$MAX_MOVES_PER_EPISODE" \
-  --output-dir "$OUTPUT_DIR" \
-  "$@"
+EXTRA_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    RESUME|RESUME=1|--resume)
+      RESUME=1
+      ;;
+    RESUME_CHECKPOINT=*)
+      RESUME_CHECKPOINT="${arg#RESUME_CHECKPOINT=}"
+      ;;
+    *)
+      EXTRA_ARGS+=("$arg")
+      ;;
+  esac
+done
+
+TRAIN_ARGS=(
+  --device cuda
+  --eval-episodes "$EVAL_EPISODES"
+  --eval-sims "$EVAL_SIMS"
+  --selfplay-episodes-per-iter "$SELFPLAY_EPISODES_PER_ITER"
+  --selfplay-sims "$SELFPLAY_SIMS"
+  --discount "$DISCOUNT"
+  --truncation-penalty "$TRUNCATION_PENALTY"
+  --time-penalty-max-per-episode "$TIME_PENALTY_MAX_PER_EPISODE"
+  --max-moves-per-episode "$MAX_MOVES_PER_EPISODE"
+  --output-dir "$OUTPUT_DIR"
+)
+
+if [[ "$RESUME" == "1" ]]; then
+  TRAIN_ARGS+=(--resume)
+fi
+
+if [[ -n "$RESUME_CHECKPOINT" ]]; then
+  TRAIN_ARGS+=(--resume-checkpoint "$RESUME_CHECKPOINT")
+fi
+
+"$PYTHON_BIN" -u train_muzero.py "${TRAIN_ARGS[@]}" "${EXTRA_ARGS[@]}"

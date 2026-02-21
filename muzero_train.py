@@ -19,7 +19,7 @@ from skyjo_env import SkyjoEnv
 class MuZeroTrainConfig:
     unroll_steps: int = 5
     td_steps: int = 5
-    discount: float = 1.0
+    discount: float = 0.997
     replay_capacity_episodes: int = 1000
     batch_size: int = 64
     max_moves_per_episode: int = 2000
@@ -29,6 +29,9 @@ class MuZeroTrainConfig:
     policy_loss_weight: float = 1.0
     value_loss_weight: float = 1.0
     reward_loss_weight: float = 1.0
+    time_penalty_per_step: float = 0.0002
+    time_penalty_max_per_episode: float | None = 0.05
+    truncation_penalty: float = 1.0
     device: str = "cpu"
 
 
@@ -162,9 +165,14 @@ def _policy_dict_to_vector(policy_target: dict[int, float], action_space_size: i
 def generate_self_play_episode(
     model: MuZeroNet,
     mcts_config: MCTSConfig,
+    opponent_model: MuZeroNet | None = None,
+    learner_player_id: int = 0,
     env_factory: Callable[[], Any] | None = None,
     max_moves: int = 2000,
     device: str = "cpu",
+    time_penalty_per_step: float = 0.0,
+    time_penalty_max_per_episode: float | None = None,
+    truncation_penalty: float = 0.0,
 ) -> EpisodeRecord:
     if env_factory is None:
         env_factory = lambda: SkyjoEnv(num_players=2, seed=random.randint(0, 10_000_000), setup_mode="auto")
@@ -175,19 +183,27 @@ def generate_self_play_episode(
     terminated = False
     move_count = 0
     action_space_size = model.config.action_space_size
+    penalty_accum = 0.0
 
     while not terminated and move_count < max_moves:
         actor = env.current_player
         legal_actions = env.legal_actions()
+        acting_model = model
+        if opponent_model is not None and int(actor) != int(learner_player_id):
+            acting_model = opponent_model
         stats = run_mcts(
-            model=model,
+            model=acting_model,
             observation=observation,
             legal_action_ids=legal_actions,
             config=mcts_config,
             device=device,
         )
         next_observation, rewards, terminated, _ = env.step(stats.action)
-        reward = float(rewards.get(f"player_{actor}", 0.0))
+        penalty = float(time_penalty_per_step)
+        if time_penalty_max_per_episode is not None and time_penalty_max_per_episode >= 0.0:
+            penalty = min(penalty, max(0.0, float(time_penalty_max_per_episode) - penalty_accum))
+        penalty_accum += penalty
+        reward = float(rewards.get(f"player_{actor}", 0.0)) - penalty
 
         steps.append(
             StepRecord(
@@ -201,6 +217,10 @@ def generate_self_play_episode(
 
         observation = next_observation
         move_count += 1
+
+    if not terminated and steps and truncation_penalty > 0.0:
+        # Penalize capped episodes so the policy does not learn to stall forever.
+        steps[-1].reward -= float(truncation_penalty)
 
     return EpisodeRecord(steps=steps, terminated=terminated)
 
@@ -309,6 +329,9 @@ def collect_self_play_data(
             env_factory=env_factory,
             max_moves=train_config.max_moves_per_episode,
             device=train_config.device,
+            time_penalty_per_step=train_config.time_penalty_per_step,
+            time_penalty_max_per_episode=train_config.time_penalty_max_per_episode,
+            truncation_penalty=train_config.truncation_penalty,
         )
         replay_buffer.add_episode(episode)
         total_steps += len(episode.steps)
