@@ -9,12 +9,14 @@ import torch
 from belief_muzero_model import BeliefAwareMuZeroNet
 from muzero_mcts import MCTSConfig, SearchStats
 from muzero_model import observation_batch_to_tensors
+from skyjo_decision_env import DecisionAction, DecisionPhase
 
 
 @dataclass
 class _Node:
     prior: float
     current_player_id: int
+    decision_phase_id: int | None = None
     visit_count: int = 0
     value_sum: float = 0.0
     reward: float = 0.0
@@ -93,13 +95,41 @@ def _add_root_noise(root: _Node, legal_actions: list[int], cfg: MCTSConfig) -> N
         )
 
 
-def _backpropagate(path: list[_Node], leaf_value: float, discount: float, min_max_stats: _MinMaxStats) -> None:
+def _backpropagate(
+    path: list[_Node],
+    leaf_value: float,
+    discount: float,
+    reward_offset: float,
+    min_max_stats: _MinMaxStats,
+) -> None:
     value = leaf_value
     for node in reversed(path):
         node.value_sum += value
         node.visit_count += 1
         min_max_stats.update(node.value())
-        value = node.reward + discount * value
+        value = (node.reward + reward_offset) + discount * value
+
+
+def _infer_next_player_and_phase(
+    current_player_id: int,
+    decision_phase_id: int | None,
+    action_id: int,
+    num_players: int,
+) -> tuple[int, int | None]:
+    if decision_phase_id is None:
+        return (current_player_id + 1) % max(1, num_players), None
+
+    phase = int(decision_phase_id)
+    if phase == int(DecisionPhase.CHOOSE_SOURCE):
+        if action_id == int(DecisionAction.CHOOSE_DISCARD):
+            return current_player_id, int(DecisionPhase.CHOOSE_POSITION)
+        return current_player_id, int(DecisionPhase.KEEP_OR_DISCARD)
+    if phase == int(DecisionPhase.KEEP_OR_DISCARD):
+        return current_player_id, int(DecisionPhase.CHOOSE_POSITION)
+    if phase == int(DecisionPhase.CHOOSE_POSITION):
+        return (current_player_id + 1) % max(1, num_players), int(DecisionPhase.CHOOSE_SOURCE)
+
+    return (current_player_id + 1) % max(1, num_players), decision_phase_id
 
 
 def run_belief_mcts(
@@ -108,6 +138,7 @@ def run_belief_mcts(
     legal_action_ids: list[int],
     ego_player_id: int,
     config: MCTSConfig | None = None,
+    ablate_belief_head: bool = False,
     device: str | torch.device = "cpu",
 ) -> SearchStats:
     cfg = config or MCTSConfig()
@@ -128,18 +159,28 @@ def run_belief_mcts(
 
     current_player_id = int(observation["current_player"])
     num_players = int(len(observation.get("scores", [])) or 2)
+    decision_phase_id = observation.get("decision_phase_id")
+    if decision_phase_id is not None:
+        decision_phase_id = int(decision_phase_id)
 
-    root = _Node(prior=1.0, current_player_id=current_player_id)
+    root = _Node(prior=1.0, current_player_id=current_player_id, decision_phase_id=decision_phase_id)
     obs_tokens = observation_batch_to_tensors([observation], history_length=model.config.history_length, device=dev)
     ego_tensor = torch.tensor([ego_player_id], dtype=torch.long, device=dev)
     cur_tensor = torch.tensor([current_player_id], dtype=torch.long, device=dev)
     nplayers_tensor = torch.tensor([num_players], dtype=torch.long, device=dev)
 
     with torch.no_grad():
-        initial = model.initial_inference(obs_tokens, ego_tensor, cur_tensor, nplayers_tensor)
-        root.hidden_state = initial.hidden_state[0]
-        root_value = model.value_support.logits_to_scalar(initial.value_logits[0]).item()
-        root_logits = initial.policy_logits[0]
+        if ablate_belief_head:
+            hidden_state = model.representation(obs_tokens)
+            root.hidden_state = hidden_state[0]
+            root_policy_logits, root_value_logits, _, _ = model.prediction(hidden_state)
+            root_value = model.value_support.logits_to_scalar(root_value_logits[0]).item()
+            root_logits = root_policy_logits[0]
+        else:
+            initial = model.initial_inference(obs_tokens, ego_tensor, cur_tensor, nplayers_tensor)
+            root.hidden_state = initial.hidden_state[0]
+            root_value = model.value_support.logits_to_scalar(initial.value_logits[0]).item()
+            root_logits = initial.policy_logits[0]
 
     mask = torch.zeros_like(root_logits)
     mask[legal_actions] = 1.0
@@ -150,6 +191,7 @@ def run_belief_mcts(
         root.children[action] = _Node(
             prior=float(priors[action].item()),
             current_player_id=current_player_id,
+            decision_phase_id=decision_phase_id,
         )
 
     _add_root_noise(root, legal_actions, cfg)
@@ -167,22 +209,42 @@ def run_belief_mcts(
                 parent = path[-2]
                 if parent.hidden_state is None:
                     raise RuntimeError("Missing parent hidden state during expansion.")
-                next_player_id = (parent.current_player_id + 1) % max(1, num_players)
+                next_player_id, next_phase_id = _infer_next_player_and_phase(
+                    current_player_id=parent.current_player_id,
+                    decision_phase_id=parent.decision_phase_id,
+                    action_id=chosen_action,
+                    num_players=num_players,
+                )
                 a = torch.tensor([chosen_action], dtype=torch.long, device=dev)
                 cur = torch.tensor([next_player_id], dtype=torch.long, device=dev)
                 with torch.no_grad():
-                    rec = model.recurrent_inference(parent.hidden_state.unsqueeze(0), a, ego_tensor, cur, nplayers_tensor)
-                    node.hidden_state = rec.hidden_state[0]
-                    node.current_player_id = next_player_id
-                    node.reward = model.reward_support.logits_to_scalar(rec.reward_logits[0]).item()
-                    value = model.value_support.logits_to_scalar(rec.value_logits[0]).item()
-                    probs = torch.softmax(rec.policy_logits[0], dim=-1)
+                    if ablate_belief_head:
+                        next_hidden_state, reward_logits = model.dynamics(parent.hidden_state.unsqueeze(0), a)
+                        policy_logits, value_logits, _, _ = model.prediction(next_hidden_state)
+                        node.hidden_state = next_hidden_state[0]
+                        node.current_player_id = next_player_id
+                        node.decision_phase_id = next_phase_id
+                        node.reward = model.reward_support.logits_to_scalar(reward_logits[0]).item()
+                        value = model.value_support.logits_to_scalar(value_logits[0]).item()
+                        probs = torch.softmax(policy_logits[0], dim=-1)
+                    else:
+                        rec = model.recurrent_inference(parent.hidden_state.unsqueeze(0), a, ego_tensor, cur, nplayers_tensor)
+                        node.hidden_state = rec.hidden_state[0]
+                        node.current_player_id = next_player_id
+                        node.decision_phase_id = next_phase_id
+                        node.reward = model.reward_support.logits_to_scalar(rec.reward_logits[0]).item()
+                        value = model.value_support.logits_to_scalar(rec.value_logits[0]).item()
+                        probs = torch.softmax(rec.policy_logits[0], dim=-1)
                 for action_id in range(action_space_size):
-                    node.children[action_id] = _Node(prior=float(probs[action_id].item()), current_player_id=next_player_id)
-                _backpropagate(path, value, cfg.discount, min_max_stats)
+                    node.children[action_id] = _Node(
+                        prior=float(probs[action_id].item()),
+                        current_player_id=next_player_id,
+                        decision_phase_id=next_phase_id,
+                    )
+                _backpropagate(path, value, cfg.discount, float(cfg.reward_offset), min_max_stats)
                 break
         else:
-            _backpropagate(path, 0.0, cfg.discount, min_max_stats)
+            _backpropagate(path, 0.0, cfg.discount, float(cfg.reward_offset), min_max_stats)
 
     visits = {action: child.visit_count for action, child in root.children.items()}
     q_values = {action: child.value() for action, child in root.children.items()}

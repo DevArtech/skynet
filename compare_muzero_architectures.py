@@ -45,20 +45,34 @@ def _load_belief(path: str, device: torch.device) -> BeliefAwareMuZeroNet:
 
 def _select_action(
     policy_name: str,
-    baseline: MuZeroNet,
+    baseline: MuZeroNet | None,
     belief: BeliefAwareMuZeroNet,
     obs: dict,
     legal_actions: list[int],
     current_player: int,
     cfg: MCTSConfig,
+    ablate_belief_head: bool,
     device: str,
 ) -> int:
     if policy_name == "baseline":
+        if baseline is None:
+            raise ValueError("Baseline policy requested but baseline model is not loaded.")
         stats = run_mcts(
             model=baseline,
             observation=obs,
             legal_action_ids=legal_actions,
             config=cfg,
+            device=device,
+        )
+        return int(stats.action)
+    if policy_name == "belief_ablated":
+        stats = run_belief_mcts(
+            model=belief,
+            observation=obs,
+            legal_action_ids=legal_actions,
+            ego_player_id=current_player,
+            config=cfg,
+            ablate_belief_head=True,
             device=device,
         )
         return int(stats.action)
@@ -69,19 +83,23 @@ def _select_action(
         legal_action_ids=legal_actions,
         ego_player_id=current_player,
         config=cfg,
+        ablate_belief_head=ablate_belief_head,
         device=device,
     )
     return int(stats.action)
 
 
 def play_match(
-    baseline: MuZeroNet,
+    baseline: MuZeroNet | None,
     belief: BeliefAwareMuZeroNet,
     seat0_policy: str,
     seat1_policy: str,
     sims: int,
     max_moves: int,
     seed: int,
+    ablate_belief_head: bool,
+    neutralize_time_penalty: bool,
+    time_penalty_per_step: float,
     device: str,
     env_mode: str,
 ) -> dict[str, float]:
@@ -90,7 +108,14 @@ def play_match(
     else:
         env = SkyjoEnv(num_players=2, seed=seed, setup_mode="auto")
     obs = env.reset()
-    cfg = MCTSConfig(num_simulations=sims, temperature=1e-8, add_exploration_noise=False, root_exploration_fraction=0.0)
+    reward_offset = float(time_penalty_per_step) if neutralize_time_penalty else 0.0
+    cfg = MCTSConfig(
+        num_simulations=sims,
+        temperature=1e-8,
+        add_exploration_noise=False,
+        root_exploration_fraction=0.0,
+        reward_offset=reward_offset,
+    )
 
     terminated = False
     steps = 0
@@ -105,6 +130,7 @@ def play_match(
             legal_actions=env.legal_actions(),
             current_player=player,
             cfg=cfg,
+            ablate_belief_head=ablate_belief_head,
             device=device,
         )
         obs, _, terminated, _ = env.step(action)
@@ -128,8 +154,15 @@ def play_match(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare baseline MuZero vs belief-aware MuZero in head-to-head games.")
-    parser.add_argument("--baseline-checkpoint", type=str, required=True)
+    parser.add_argument("--baseline-checkpoint", type=str, default="")
     parser.add_argument("--belief-checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--matchup",
+        type=str,
+        choices=["baseline_vs_belief", "belief_vs_ablated"],
+        default="baseline_vs_belief",
+        help="Choose which agents compete in head-to-head.",
+    )
     parser.add_argument("--games", type=int, default=40)
     parser.add_argument("--sims", type=int, default=200)
     parser.add_argument("--max-moves-per-game", type=int, default=2000)
@@ -137,10 +170,36 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=str, default="runs/muzero_arch_compare")
     parser.add_argument("--env-mode", type=str, choices=["decision", "macro"], default="decision")
+    parser.add_argument(
+        "--ablate-belief-head",
+        action="store_true",
+        help="If set, disable belief-conditioning path during belief model inference for ablation.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=25,
+        help="Print running head-to-head metrics every N completed games.",
+    )
+    parser.add_argument(
+        "--neutralize-time-penalty",
+        action="store_true",
+        help="Add back a fixed per-step reward offset in MCTS backups to neutralize training time-penalty bias.",
+    )
+    parser.add_argument(
+        "--time-penalty-per-step",
+        type=float,
+        default=0.0002,
+        help="Per-step penalty magnitude to neutralize when --neutralize-time-penalty is set.",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
-    baseline = _load_baseline(args.baseline_checkpoint, device)
+    baseline: MuZeroNet | None = None
+    if args.matchup == "baseline_vs_belief":
+        if not args.baseline_checkpoint:
+            raise ValueError("--baseline-checkpoint is required for matchup=baseline_vs_belief")
+        baseline = _load_baseline(args.baseline_checkpoint, device)
     belief = _load_belief(args.belief_checkpoint, device)
 
     out_dir = Path(args.output_dir)
@@ -149,14 +208,29 @@ def main() -> None:
     _ensure_dir(graph_dir)
 
     rows: list[dict[str, float | str]] = []
-    belief_wins = 0
-    baseline_wins = 0
+    side_a_wins = 0
+    side_b_wins = 0
     draws = 0
+    log_every = max(1, int(args.log_every))
+    if args.matchup == "baseline_vs_belief":
+        side_a_policy = "belief"
+        side_b_policy = "baseline"
+    else:
+        side_a_policy = "belief"
+        side_b_policy = "belief_ablated"
+
+    print(
+        f"[h2h config] matchup={args.matchup} "
+        f"side_a={side_a_policy} side_b={side_b_policy} "
+        f"belief_head_ablated_flag={bool(args.ablate_belief_head)} "
+        f"neutralize_time_penalty={bool(args.neutralize_time_penalty)} "
+        f"time_penalty_per_step={float(args.time_penalty_per_step):.6f}"
+    )
 
     for g in range(args.games):
         swap = g % 2 == 1
-        seat0_policy = "belief" if not swap else "baseline"
-        seat1_policy = "baseline" if not swap else "belief"
+        seat0_policy = side_a_policy if not swap else side_b_policy
+        seat1_policy = side_b_policy if not swap else side_a_policy
         result = play_match(
             baseline=baseline,
             belief=belief,
@@ -165,6 +239,9 @@ def main() -> None:
             sims=args.sims,
             max_moves=args.max_moves_per_game,
             seed=args.seed + g,
+            ablate_belief_head=args.ablate_belief_head,
+            neutralize_time_penalty=args.neutralize_time_penalty,
+            time_penalty_per_step=args.time_penalty_per_step,
             device=args.device,
             env_mode=args.env_mode,
         )
@@ -174,10 +251,10 @@ def main() -> None:
             winner_name = "draw"
         else:
             winner_name = seat0_policy if winner == 0 else seat1_policy
-            if winner_name == "belief":
-                belief_wins += 1
+            if winner_name == side_a_policy:
+                side_a_wins += 1
             else:
-                baseline_wins += 1
+                side_b_wins += 1
 
         rows.append(
             {
@@ -192,16 +269,36 @@ def main() -> None:
             }
         )
 
+        done = g + 1
+        if done % log_every == 0 or done == args.games:
+            print(
+                f"[h2h] {done}/{args.games} games "
+                f"{side_a_policy}_wins={side_a_wins} {side_b_policy}_wins={side_b_wins} draws={draws} "
+                f"{side_a_policy}_win_rate={side_a_wins / done:.3f} {side_b_policy}_win_rate={side_b_wins / done:.3f} "
+                f"draw_rate={draws / done:.3f}"
+            )
+
     total = max(1, args.games)
     summary = {
         "games": args.games,
-        "belief_wins": belief_wins,
-        "baseline_wins": baseline_wins,
+        "matchup": args.matchup,
+        "side_a_policy": side_a_policy,
+        "side_b_policy": side_b_policy,
+        "belief_head_ablated": bool(args.ablate_belief_head),
+        "neutralize_time_penalty": bool(args.neutralize_time_penalty),
+        "time_penalty_per_step": float(args.time_penalty_per_step),
+        "side_a_wins": side_a_wins,
+        "side_b_wins": side_b_wins,
         "draws": draws,
-        "belief_win_rate": belief_wins / total,
-        "baseline_win_rate": baseline_wins / total,
+        "side_a_win_rate": side_a_wins / total,
+        "side_b_win_rate": side_b_wins / total,
         "draw_rate": draws / total,
     }
+    if args.matchup == "baseline_vs_belief":
+        summary["belief_wins"] = side_a_wins
+        summary["baseline_wins"] = side_b_wins
+        summary["belief_win_rate"] = side_a_wins / total
+        summary["baseline_win_rate"] = side_b_wins / total
 
     with (out_dir / "summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -214,8 +311,8 @@ def main() -> None:
             writer.writerow(row)
 
     plt.figure(figsize=(6, 4))
-    labels = ["belief", "baseline", "draw"]
-    values = [belief_wins, baseline_wins, draws]
+    labels = [side_a_policy, side_b_policy, "draw"]
+    values = [side_a_wins, side_b_wins, draws]
     plt.bar(labels, values)
     plt.title("MuZero Architecture Head-to-Head Results")
     plt.ylabel("Games")

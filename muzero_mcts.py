@@ -20,6 +20,7 @@ class MCTSConfig:
     root_exploration_fraction: float = 0.25
     temperature: float = 1.0
     add_exploration_noise: bool = True
+    reward_offset: float = 0.0
 
 
 @dataclass
@@ -163,6 +164,20 @@ def _backpropagate(search_path: list[Node], value: float, discount: float, min_m
         value = node.reward + discount * value
 
 
+def _backpropagate_with_offset(
+    search_path: list[Node],
+    value: float,
+    discount: float,
+    reward_offset: float,
+    min_max_stats: MinMaxStats,
+) -> None:
+    for node in reversed(search_path):
+        node.value_sum += value
+        node.visit_count += 1
+        min_max_stats.update(node.value())
+        value = (node.reward + reward_offset) + discount * value
+
+
 def _policy_from_visits(visit_counts: dict[int, int], temperature: float) -> dict[int, float]:
     if not visit_counts:
         return {}
@@ -236,7 +251,16 @@ def run_mcts(
             # Not expected for root in this setup, but keep safe fallback.
             leaf_value = 0.0
 
-        _backpropagate(search_path, leaf_value, cfg.discount, min_max_stats)
+        if abs(float(cfg.reward_offset)) > 0.0:
+            _backpropagate_with_offset(
+                search_path=search_path,
+                value=leaf_value,
+                discount=cfg.discount,
+                reward_offset=float(cfg.reward_offset),
+                min_max_stats=min_max_stats,
+            )
+        else:
+            _backpropagate(search_path, leaf_value, cfg.discount, min_max_stats)
 
     visit_counts = {action: child.visit_count for action, child in root.children.items()}
     q_values = {action: child.value() for action, child in root.children.items()}
