@@ -20,6 +20,41 @@ For full details, read:
 
 - `SKYJO_ENVIRONMENT.md`
 
+## Web UI (FastAPI + React)
+
+This repo now includes a browser UI in `web/` for:
+
+- Human-vs-AI gameplay
+- AI-vs-AI visualized autoplay
+
+The web architecture is stateless on the backend: the frontend owns game session state
+and sends serialized state to backend endpoints for action application and model inference.
+
+### Install
+
+```bash
+pip install -e .
+cd web/frontend
+npm install
+cd ../..
+```
+
+### Run
+
+```bash
+python web/run_dev.py
+```
+
+Manual alternative:
+
+```bash
+uvicorn web.backend.main:app --reload --port 8000
+cd web/frontend
+npm run dev
+```
+
+See `web/README.md` for API details, checkpoint selection, and smoke tests.
+
 ## MuZero Training
 
 This repo includes two trainable architectures:

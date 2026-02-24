@@ -3,8 +3,27 @@ name = "skynet"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
+    "fastapi",
     "matplotlib",
+    "pytest",
     "torch",
+    "uvicorn[standard]",
+]
+
+[tool.setuptools]
+py-modules = [
+    "main",
+    "skyjo_env",
+    "skyjo_decision_env",
+    "muzero_model",
+    "muzero_mcts",
+    "muzero_train",
+    "train_muzero",
+    "belief_muzero_model",
+    "belief_muzero_mcts",
+    "belief_muzero_train",
+    "train_belief_muzero",
+    "compare_muzero_architectures",
 ]

@@ -1,0 +1,1 @@
+"""Skyjo web package."""

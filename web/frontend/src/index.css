@@ -1,0 +1,38 @@
+:root {
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #1f2430;
+  background-color: #f3f5fa;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: #f3f5fa;
+}
+
+button {
+  border-radius: 8px;
+  border: 1px solid #c4c9d7;
+  padding: 0.6em 1.2em;
+  font-size: 0.95rem;
+  font-weight: 500;
+  font-family: inherit;
+  background-color: #ffffff;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+button:hover {
+  border-color: #4a74d9;
+}
+button:focus,
+button:focus-visible {
+  outline: 2px solid #4a74d9;
+  outline-offset: 1px;
+}

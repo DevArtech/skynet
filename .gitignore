@@ -4,3 +4,7 @@ SKYNET.md
 learnings/
 *.out
 *.err
+web/frontend/node_modules/
+web/frontend/dist/
+web/frontend/.vitest/
+*.egg-info/
