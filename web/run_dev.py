@@ -14,7 +14,7 @@ def main() -> int:
     frontend_cmd = ["npm", "run", "dev"]
 
     backend = subprocess.Popen(backend_cmd, cwd=ROOT)
-    frontend = subprocess.Popen(frontend_cmd, cwd=FRONTEND_DIR, shell=True)
+    frontend = subprocess.Popen(frontend_cmd, cwd=FRONTEND_DIR)
     try:
         backend.wait()
     except KeyboardInterrupt:

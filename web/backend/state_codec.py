@@ -37,6 +37,7 @@ def dump_env_state(env: SkyjoEnv) -> dict[str, Any]:
         "setup_reveals_remaining": [int(v) for v in env.setup_reveals_remaining],
         "pending_final_turn_players": sorted(int(v) for v in env.pending_final_turn_players),
         "round_ender": None if env.round_ender is None else int(env.round_ender),
+        "column_clear_used_this_round": [bool(v) for v in env.column_clear_used_this_round],
         "game_over": bool(env.game_over),
         "round_history_start_index": int(env.round_history_start_index),
         "public_history": [
@@ -85,6 +86,11 @@ def restore_env_state(state: dict[str, Any]) -> SkyjoEnv:
     env.setup_reveals_remaining = [int(v) for v in state["setup_reveals_remaining"]]
     env.pending_final_turn_players = {int(v) for v in state["pending_final_turn_players"]}
     env.round_ender = None if state["round_ender"] is None else int(state["round_ender"])
+    column_clear_used = state.get("column_clear_used_this_round")
+    if isinstance(column_clear_used, list):
+        env.column_clear_used_this_round = [bool(v) for v in column_clear_used]
+    else:
+        env.column_clear_used_this_round = [False] * env.num_players
     env.game_over = bool(state["game_over"])
     env.round_history_start_index = int(state["round_history_start_index"])
     env.public_history = [

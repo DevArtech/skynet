@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 
 from fastapi.testclient import TestClient
-from skyjo_env import SkyjoEnv
+from skyjo_env import SkyjoEnv, TurnPhase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -89,3 +89,33 @@ def test_infer_agent_step_with_heuristic_agent() -> None:
     assert "state" in payload
     assert "view" in payload
     assert "step_log" in payload
+
+
+def test_column_clear_only_applies_once_per_player_per_round() -> None:
+    env = SkyjoEnv(num_players=2, seed=3, setup_mode="manual")
+    env.reset()
+    env.phase = TurnPhase.MAIN
+    env.current_player = 0
+    board = env.boards[0]
+
+    # Prepare two matching visible columns for the same player.
+    for pos in range(12):
+        board.cards[pos] = 9
+        board.visible[pos] = False
+        board.removed[pos] = False
+
+    for pos in (0, 4, 8):
+        board.cards[pos] = 2
+        board.visible[pos] = True
+    for pos in (1, 5, 9):
+        board.cards[pos] = 7
+        board.visible[pos] = True
+
+    env._resolve_columns(0)
+    assert env.column_clear_used_this_round[0] is True
+    assert all(board.removed[pos] for pos in (0, 4, 8))
+    assert all(not board.removed[pos] for pos in (1, 5, 9))
+
+    # Further checks in the same round should not clear another column.
+    env._resolve_columns(0)
+    assert all(not board.removed[pos] for pos in (1, 5, 9))

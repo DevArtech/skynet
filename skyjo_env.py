@@ -203,6 +203,7 @@ class SkyjoEnv:
         self.setup_reveals_remaining: list[int] = [2] * self.num_players
         self.pending_final_turn_players: set[int] = set()
         self.round_ender: int | None = None
+        self.column_clear_used_this_round: list[bool] = [False] * self.num_players
         self.game_over = False
 
     def reset(self, seed: int | None = None) -> dict[str, Any]:
@@ -339,6 +340,7 @@ class SkyjoEnv:
             "setup_reveals_remaining": list(self.setup_reveals_remaining),
             "round_ender": self.round_ender,
             "pending_final_turn_players": sorted(self.pending_final_turn_players),
+            "column_clear_used_this_round": list(self.column_clear_used_this_round),
             "game_over": self.game_over,
             "public_history_size": len(self.public_history),
         }
@@ -456,6 +458,7 @@ class SkyjoEnv:
         self.round_ender = None
         self.pending_final_turn_players = set()
         self.setup_reveals_remaining = [2] * self.num_players
+        self.column_clear_used_this_round = [False] * self.num_players
         self.phase = TurnPhase.SETUP
         self.current_player = starting_player
         self.round_history_start_index = len(self.public_history)
@@ -581,6 +584,8 @@ class SkyjoEnv:
         self._start_new_round(starting_player=next_starting_player)
 
     def _resolve_columns(self, player: int) -> None:
+        if self.column_clear_used_this_round[player]:
+            return
         board = self.boards[player]
         for col in range(COLS):
             p0, p1, p2 = _column_positions(col)
@@ -610,6 +615,8 @@ class SkyjoEnv:
                     b_value=0,
                     note="column cleared",
                 )
+                self.column_clear_used_this_round[player] = True
+                break
 
     def _draw_from_deck(self) -> int:
         if not self.deck:
