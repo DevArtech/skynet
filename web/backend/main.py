@@ -184,12 +184,17 @@ def infer_agent_step(request: InferAgentStepRequest) -> AgentStepResponse:
         )
         decision_env.base = env
         if request.decision_context is not None:
-            decision_env.pending = PendingTurnState(
-                source=request.decision_context.pending_source,
-                drawn_value=request.decision_context.pending_drawn_value,
-                keep_drawn=request.decision_context.pending_keep_drawn,
-            )
-            decision_env.decision_phase = DecisionPhase(request.decision_context.decision_phase_id)
+            if request.decision_context.actor_player == env.current_player:
+                decision_env.pending = PendingTurnState(
+                    source=request.decision_context.pending_source,
+                    drawn_value=request.decision_context.pending_drawn_value,
+                    keep_drawn=request.decision_context.pending_keep_drawn,
+                )
+                decision_env.decision_phase = DecisionPhase(request.decision_context.decision_phase_id)
+            else:
+                # Defensive fallback: stale context from prior actor must not leak.
+                decision_env.pending = PendingTurnState()
+                decision_env._sync_decision_phase()
         else:
             decision_env.pending = PendingTurnState()
             decision_env._sync_decision_phase()
@@ -203,13 +208,15 @@ def infer_agent_step(request: InferAgentStepRequest) -> AgentStepResponse:
         step_log = _decision_step_log(phase_before, decision_action)
 
         _, _, _, info = decision_env.step(decision_action)
-        turn_completed = decision_env.current_player != actor_before
+        # CHOOSE_POSITION always finalizes a full turn even if next round starts with same actor.
+        turn_completed = (phase_before == DecisionPhase.CHOOSE_POSITION) or (decision_env.current_player != actor_before)
         observer = decision_env.current_player if request.observer_player is None else request.observer_player
 
         if turn_completed:
             next_context = None
         else:
             next_context = AgentDecisionContext(
+                actor_player=int(decision_env.current_player),
                 decision_phase_id=int(decision_env.decision_phase),
                 pending_source=decision_env.pending.source,
                 pending_drawn_value=decision_env.pending.drawn_value,
@@ -219,6 +226,7 @@ def infer_agent_step(request: InferAgentStepRequest) -> AgentStepResponse:
         return AgentStepResponse(
             state=dump_env_state(decision_env.base),
             view=_build_view(decision_env.base, observer_player=observer, info=info),
+            actor_player=int(actor_before),
             decision_context=next_context,
             step_log=step_log,
             turn_completed=turn_completed,

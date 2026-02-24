@@ -53,6 +53,7 @@ type SessionResponse = {
 }
 
 type AgentDecisionContext = {
+  actor_player: number
   decision_phase_id: number
   pending_source: string | null
   pending_drawn_value: number | null
@@ -67,6 +68,7 @@ type ActionResponse = SessionResponse & {
 }
 
 type AgentStepResponse = SessionResponse & {
+  actor_player: number
   decision_context: AgentDecisionContext | null
   step_log: string
   turn_completed: boolean
@@ -165,11 +167,13 @@ function App() {
   const [isAutoRunning, setIsAutoRunning] = useState(false)
   const [selectedHumanSource, setSelectedHumanSource] = useState<HumanSource | null>(null)
   const [deckDecision, setDeckDecision] = useState<DeckDecision>('keep')
+  const [pendingDeckDrawnValue, setPendingDeckDrawnValue] = useState<number | null>(null)
+  const [discardCommitted, setDiscardCommitted] = useState(false)
   const [agentDecisionContext, setAgentDecisionContext] = useState<AgentDecisionContext | null>(null)
   const [streamedStepLines, setStreamedStepLines] = useState<Array<{ id: string; text: string }>>([])
   const streamedStepSeqRef = useRef(0)
-  const roundEndCountRef = useRef(0)
   const gameSummaryLoggedRef = useRef(false)
+  const historyCursorRef = useRef(0)
   const logHistoryRef = useRef<HTMLDivElement | null>(null)
   const autoScrollLogRef = useRef(true)
 
@@ -205,6 +209,45 @@ function App() {
   }
   const canDiscardDrawn = hasLegalMacro('DRAW_DECK_DISCARD_AND_FLIP')
 
+  const currentStepInstruction = useMemo(() => {
+    if (!gameView) return ''
+    if (gameView.terminated) return 'Game ended. Review final board and action log.'
+
+    if (canPlayHumanAction) {
+      if (gameView.phase === 'SETUP') {
+        return 'Your setup step: click a hidden card on your board to reveal it.'
+      }
+      if (selectedHumanSource === null) {
+        return 'Your step: choose Deck or Discard first.'
+      }
+      if (selectedHumanSource === 'discard') {
+        return 'Your step: click a position on your board to replace with the discard card.'
+      }
+      if (deckDecision === 'discard') {
+        return 'Your step: click a hidden position on your board to flip (drawn card has moved to discard).'
+      }
+      return 'Your step: click any position on your board to replace with the drawn card or click on the drawn card to discard it.'
+    }
+
+    const actor = getActorLabel(gameView.current_player)
+    if (agentDecisionContext == null) {
+      return `${actor} is selecting a source (deck/discard). Use Step AI or Play to continue.`
+    }
+    if (agentDecisionContext.decision_phase_id === 0) {
+      return `${actor} is in setup reveal step (choosing a hidden card to reveal).`
+    }
+    if (agentDecisionContext.decision_phase_id === 1) {
+      return `${actor} is choosing source (deck or discard).`
+    }
+    if (agentDecisionContext.decision_phase_id === 2) {
+      return `${actor} is deciding to keep or discard the drawn card.`
+    }
+    if (agentDecisionContext.decision_phase_id === 3) {
+      return `${actor} is choosing board position for flip/replace.`
+    }
+    return `${actor} is taking an action step.`
+  }, [agentDecisionContext, canPlayHumanAction, deckDecision, gameView, getActorLabel, selectedHumanSource])
+
   const deckTopValue = useMemo(() => {
     const rawDeck = sessionState?.deck
     if (!Array.isArray(rawDeck) || rawDeck.length === 0) return null
@@ -228,20 +271,6 @@ function App() {
   }
 
   const actionLogLines = useMemo(() => {
-    const committedLines =
-      gameView?.public_history.flatMap((entry) => {
-        const actorType = agents[entry.actor]?.type
-        // AI turns are logged via streamed per-decision steps.
-        // Keep committed history lines for human actions/events only.
-        if (actorType === 'baseline' || actorType === 'belief') {
-          return []
-        }
-        return formatActionSteps(entry, getActorLabel(entry.actor)).map((step, idx) => ({
-          id: `${entry.step_index}-${entry.action_type}-${idx}`,
-          text: step,
-        }))
-      }) ?? []
-
     const pendingLines: Array<{ id: string; text: string }> = []
     if (canPlayHumanAction && gameView && gameView.phase !== 'SETUP') {
       const actor = gameView.current_player
@@ -249,7 +278,10 @@ function App() {
       if (selectedHumanSource === 'deck') {
         pendingLines.push({ id: 'pending-draw', text: `${label} drew from deck` })
         if (deckDecision === 'discard') {
-          pendingLines.push({ id: 'pending-discard', text: `${label} discarded drawn card and will flip a hidden card` })
+          pendingLines.push({
+            id: 'pending-discard',
+            text: `${label} discarded drawn card (${valueLabel(pendingDeckDrawnValue ?? UNKNOWN_VALUE)}) and will flip a hidden card`,
+          })
         } else {
           pendingLines.push({ id: 'pending-keep', text: `${label} kept drawn card and will replace a card` })
         }
@@ -258,8 +290,8 @@ function App() {
         pendingLines.push({ id: 'pending-place-discard', text: `${label} will replace a card` })
       }
     }
-    return [...committedLines, ...streamedStepLines, ...pendingLines]
-  }, [agents, canPlayHumanAction, deckDecision, gameView, selectedHumanSource, streamedStepLines])
+    return [...streamedStepLines, ...pendingLines]
+  }, [canPlayHumanAction, deckDecision, gameView, pendingDeckDrawnValue, selectedHumanSource, streamedStepLines, getActorLabel])
 
   const syncAgents = (nextNumPlayers: number, nextMode: GameMode) => {
     setAgents((prev) => {
@@ -357,6 +389,8 @@ function App() {
       }
       setSelectedHumanSource(null)
       setDeckDecision('keep')
+      setPendingDeckDrawnValue(null)
+      setDiscardCommitted(false)
       setSessionState(payload.state)
       setGameView(payload.view)
       setAgentDecisionContext(null)
@@ -387,7 +421,7 @@ function App() {
             ...prev,
             {
               id: `ai-step-${streamedStepSeqRef.current}`,
-              text: `${getActorLabel(localView.current_player)} ${stepPayload.step_log}`,
+              text: `${getActorLabel(stepPayload.actor_player)} ${stepPayload.step_log}`,
             },
           ])
           localState = stepPayload.state
@@ -434,7 +468,7 @@ function App() {
         ...prev,
         {
           id: `ai-step-${streamedStepSeqRef.current}`,
-          text: `${getActorLabel(gameView.current_player)} ${payload.step_log}`,
+          text: `${getActorLabel(payload.actor_player)} ${payload.step_log}`,
         },
       ])
       setSessionState(payload.state)
@@ -479,7 +513,7 @@ function App() {
           ...prev,
           {
             id: `ai-step-${streamedStepSeqRef.current}`,
-            text: `${getActorLabel(localView.current_player)} ${payload.step_log}`,
+            text: `${getActorLabel(payload.actor_player)} ${payload.step_log}`,
           },
         ])
         localState = payload.state
@@ -517,36 +551,47 @@ function App() {
       autoScrollLogRef.current = true
       setStreamedStepLines([])
       streamedStepSeqRef.current = 0
-      roundEndCountRef.current = 0
+      historyCursorRef.current = 0
       gameSummaryLoggedRef.current = false
     }
   }, [gameView])
 
   useEffect(() => {
     if (!gameView) return
+    const history = gameView.public_history
 
-    const roundEndCount = gameView.public_history.filter((entry) => entry.action_type === 'ROUND_END').length
-    if (roundEndCount < roundEndCountRef.current) {
-      roundEndCountRef.current = roundEndCount
+    if (history.length < historyCursorRef.current) {
+      historyCursorRef.current = 0
       gameSummaryLoggedRef.current = false
-      return
     }
 
-    if (roundEndCount > roundEndCountRef.current) {
-      for (let i = roundEndCountRef.current; i < roundEndCount; i += 1) {
-        streamedStepSeqRef.current += 1
-        setStreamedStepLines((prev) => [
-          ...prev,
-          {
+    if (history.length > historyCursorRef.current) {
+      const newEntries = history.slice(historyCursorRef.current)
+      const appended: Array<{ id: string; text: string }> = []
+      for (const entry of newEntries) {
+        const steps = formatActionSteps(entry, getActorLabel(entry.actor))
+        for (const step of steps) {
+          streamedStepSeqRef.current += 1
+          appended.push({
+            id: `hist-${streamedStepSeqRef.current}`,
+            text: step,
+          })
+        }
+        if (entry.action_type === 'ROUND_END') {
+          streamedStepSeqRef.current += 1
+          appended.push({
             id: `summary-round-${streamedStepSeqRef.current}`,
             text: `Round Summary — Round Scores: ${formatScoreSummary(gameView.round_scores, getActorLabel)} | Total Scores: ${formatScoreSummary(
               gameView.scores,
               getActorLabel,
             )}`,
-          },
-        ])
+          })
+        }
       }
-      roundEndCountRef.current = roundEndCount
+      if (appended.length > 0) {
+        setStreamedStepLines((prev) => [...prev, ...appended])
+      }
+      historyCursorRef.current = history.length
     }
 
     if (gameView.terminated && !gameSummaryLoggedRef.current) {
@@ -591,11 +636,15 @@ function App() {
     if (!canPlayHumanAction) {
       setSelectedHumanSource(null)
       setDeckDecision('keep')
+      setPendingDeckDrawnValue(null)
+      setDiscardCommitted(false)
       return
     }
     if (gameView?.phase === 'SETUP') {
       setSelectedHumanSource(null)
       setDeckDecision('keep')
+      setPendingDeckDrawnValue(null)
+      setDiscardCommitted(false)
     }
   }, [canPlayHumanAction, gameView?.phase])
 
@@ -741,6 +790,7 @@ function App() {
 
           <section className="panel board-section">
             <h2>Board Views</h2>
+            <p className="board-instruction">{currentStepInstruction}</p>
             <div className="boards">
               {Object.entries(gameView.board_views).map(([player, board]) => (
                 <article className="board" key={player}>
@@ -785,56 +835,67 @@ function App() {
                   <p>Choose source, preview card, then click a board position.</p>
                   <div className="actions">
                     <button
-                      disabled={!hasLegalMacro('DRAW_DECK_KEEP_AND_REPLACE') || loading}
+                      disabled={!hasLegalMacro('DRAW_DECK_KEEP_AND_REPLACE') || discardCommitted || loading}
                       className={selectedHumanSource === 'deck' ? 'selected' : ''}
                       onClick={() => {
                         setSelectedHumanSource('deck')
                         setDeckDecision('keep')
+                        setPendingDeckDrawnValue(deckTopValue)
+                        setDiscardCommitted(false)
                       }}
                     >
                       <CardBox label={`Deck (${gameView.deck_size})`} value={null} unknownLabel="?" />
                     </button>
                     <button
-                      disabled={!hasLegalMacro('TAKE_DISCARD_AND_REPLACE') || loading}
+                      disabled={!hasLegalMacro('TAKE_DISCARD_AND_REPLACE') || discardCommitted || loading}
                       className={selectedHumanSource === 'discard' ? 'selected' : ''}
                       onClick={() => {
                         setSelectedHumanSource('discard')
                         setDeckDecision('keep')
+                        setPendingDeckDrawnValue(null)
+                        setDiscardCommitted(false)
                       }}
                     >
-                      <CardBox label="Discard" value={gameView.discard_top} />
+                      <CardBox
+                        label="Discard"
+                        value={discardCommitted && pendingDeckDrawnValue !== null ? pendingDeckDrawnValue : gameView.discard_top}
+                      />
                     </button>
-                  </div>
-                  <button
-                    type="button"
-                    className={`draw-preview-button ${
-                      selectedHumanSource === 'deck' && canDiscardDrawn ? 'can-discard' : ''
-                    } ${
-                      selectedHumanSource === 'deck' && deckDecision === 'discard' ? 'selected' : ''
-                    }`}
-                    disabled={selectedHumanSource !== 'deck' || !canDiscardDrawn || loading}
-                    onClick={() => {
-                      if (selectedHumanSource === 'deck') {
-                        setDeckDecision((prev) => (prev === 'keep' ? 'discard' : 'keep'))
-                      }
-                    }}
-                  >
-                    <div className="draw-preview">
+                    <button
+                      type="button"
+                      className={`draw-preview-button ${
+                        selectedHumanSource === 'deck' && canDiscardDrawn ? 'can-discard' : ''
+                      } ${
+                        selectedHumanSource === 'deck' && deckDecision === 'discard' ? 'selected' : ''
+                      }`}
+                      disabled={selectedHumanSource !== 'deck' || !canDiscardDrawn || discardCommitted || loading}
+                      onClick={() => {
+                        if (selectedHumanSource === 'deck' && !discardCommitted) {
+                          setDeckDecision('discard')
+                          setDiscardCommitted(true)
+                        }
+                      }}
+                    >
                       <CardBox
                         label="Drawn Card"
-                        value={selectedHumanSource === null ? null : selectedHumanSource === 'deck' ? deckTopValue : gameView.discard_top}
+                        value={
+                          selectedHumanSource === null
+                            ? null
+                            : selectedHumanSource === 'deck'
+                              ? discardCommitted
+                                ? null
+                                : pendingDeckDrawnValue
+                              : gameView.discard_top
+                        }
                         unknownLabel="?"
                       />
-                      {selectedHumanSource === 'deck' && (
-                        <small className="draw-mode-hint">
-                          Mode:{' '}
-                          {deckDecision === 'keep'
-                            ? 'Keep and replace any slot'
-                            : 'Discard and flip unknown slot'}
-                        </small>
-                      )}
-                    </div>
-                  </button>
+                    </button>
+                    {selectedHumanSource === 'deck' && (
+                      <small className="draw-mode-hint">
+                        Mode: {deckDecision === 'keep' ? 'Keep and replace any slot' : 'Discard and flip unknown slot'}
+                      </small>
+                    )}
+                  </div>
                 </div>
               )
             ) : (
@@ -879,9 +940,9 @@ function App() {
           <section className="panel">
             <h2>Public Action Log</h2>
             <div className="history" ref={logHistoryRef} onScroll={handleLogScroll}>
-              {actionLogLines.map((entry) => (
+              {actionLogLines.map((entry, idx) => (
                 <div key={entry.id}>
-                  {entry.text}
+                  {idx + 1}. {entry.text}
                 </div>
               ))}
             </div>

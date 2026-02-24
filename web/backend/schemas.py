@@ -67,6 +67,7 @@ class InferActionRequest(StateRequest):
 
 
 class AgentDecisionContext(BaseModel):
+    actor_player: int
     decision_phase_id: int
     pending_source: str | None = None
     pending_drawn_value: int | None = None
@@ -116,6 +117,7 @@ class AutoPlayResponse(SessionResponse):
 
 
 class AgentStepResponse(SessionResponse):
+    actor_player: int
     decision_context: AgentDecisionContext | None = None
     step_log: str
     turn_completed: bool

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import base64
+import pickle
 from typing import Any
 
 from skyjo_env import PlayerBoard, PublicAction, PublicActionType, SkyjoEnv, TurnPhase
 
 
 def dump_env_state(env: SkyjoEnv) -> dict[str, Any]:
+    rng_state_b64 = base64.b64encode(pickle.dumps(env.rng.getstate())).decode("ascii")
     return {
         "initial_seed": int(env.initial_seed),
+        "rng_state_b64": rng_state_b64,
         "num_players": int(env.num_players),
         "history_window_k": int(env.history_window_k),
         "score_limit": int(env.score_limit),
@@ -97,4 +101,7 @@ def restore_env_state(state: dict[str, Any]) -> SkyjoEnv:
         )
         for a in state["public_history"]
     ]
+    rng_state_b64 = state.get("rng_state_b64")
+    if isinstance(rng_state_b64, str) and rng_state_b64:
+        env.rng.setstate(pickle.loads(base64.b64decode(rng_state_b64.encode("ascii"))))
     return env
