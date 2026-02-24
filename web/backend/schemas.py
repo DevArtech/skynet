@@ -15,6 +15,7 @@ class AgentType(str, Enum):
     HUMAN = "human"
     BASELINE = "baseline"
     BELIEF = "belief"
+    HEURISTIC = "heuristic"
 
 
 class AgentConfig(BaseModel):
@@ -23,6 +24,8 @@ class AgentConfig(BaseModel):
     simulations: int = Field(default=32, ge=1, le=400)
     device: str = "cpu"
     ablate_belief_head: bool = False
+    heuristic_bot_name: str = "greedy_value_replacement"
+    heuristic_bot_epsilon: float = Field(default=0.02, ge=0.0, le=1.0)
 
 
 class CreateGameRequest(BaseModel):

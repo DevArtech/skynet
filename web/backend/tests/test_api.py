@@ -56,3 +56,36 @@ def test_state_codec_preserves_rng_state() -> None:
 
     # RNG continuity must match across serialization boundaries.
     assert env.rng.random() == restored.rng.random()
+
+
+def test_infer_agent_step_with_heuristic_agent() -> None:
+    create = client.post(
+        "/api/session/new",
+        json={
+            "num_players": 2,
+            "seed": 11,
+            "setup_mode": "manual",
+            "observer_player": 0,
+        },
+    )
+    assert create.status_code == 200
+    session = create.json()
+
+    step = client.post(
+        "/api/session/infer-agent-step",
+        json={
+            "state": session["state"],
+            "observer_player": 0,
+            "agent": {
+                "type": "heuristic",
+                "heuristic_bot_name": "greedy_value_replacement",
+                "heuristic_bot_epsilon": 0.0,
+            },
+            "decision_context": None,
+        },
+    )
+    assert step.status_code == 200
+    payload = step.json()
+    assert "state" in payload
+    assert "view" in payload
+    assert "step_log" in payload

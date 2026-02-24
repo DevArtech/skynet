@@ -11,6 +11,7 @@ from muzero_mcts import MCTSConfig, run_mcts
 from muzero_model import MuZeroNet, build_default_skyjo_muzero_config
 from skyjo_decision_env import DecisionAction, DecisionPhase, PendingTurnState, SkyjoDecisionEnv
 from skyjo_env import SkyjoEnv, action_to_macro, macro_to_action
+from heuristic_bots import make_heuristic_bot
 
 from .schemas import AIActionResult, AgentConfig, AgentType
 from .checkpoints import find_latest_checkpoint
@@ -22,7 +23,22 @@ class AgentService:
         self._belief_cache: dict[tuple[str, str], BeliefAwareMuZeroNet] = {}
         self._project_root = Path(__file__).resolve().parents[2]
 
+    def _heuristic_seed(self, observation: dict[str, Any]) -> int:
+        # Keep heuristic behavior deterministic for a given game state while
+        # still varying decisions across different states.
+        parts = (
+            int(observation.get("current_player", 0)),
+            int(observation.get("global_step", 0)),
+            int(observation.get("round_step", 0)),
+            int(observation.get("deck_size", 0)),
+            int(observation.get("discard_top", 0)),
+            str(observation.get("decision_phase", "")),
+        )
+        return hash(parts) & 0x7FFFFFFF
+
     def _resolve_checkpoint(self, agent_type: AgentType, configured_path: str | None) -> Path:
+        if agent_type == AgentType.HEURISTIC:
+            raise ValueError("Heuristic agents do not use checkpoints.")
         if configured_path:
             path = Path(configured_path)
             if not path.is_absolute():
@@ -169,6 +185,24 @@ class AgentService:
         actor = int(observation["current_player"])
         if agent.type == AgentType.HUMAN:
             raise ValueError("Cannot select AI action for human agent.")
+        if agent.type == AgentType.HEURISTIC:
+            bot = make_heuristic_bot(
+                name=agent.heuristic_bot_name,
+                seed=self._heuristic_seed(observation),
+                epsilon=agent.heuristic_bot_epsilon,
+            )
+            action_id = int(bot.select_action(observation, legal_actions))
+            macro_action, position = action_to_macro(action_id)
+            return AIActionResult(
+                actor=actor,
+                action_id=action_id,
+                macro_action=macro_action,
+                position=position,
+                root_value=None,
+                visit_counts=None,
+                q_values=None,
+                policy_target=None,
+            )
 
         cfg = MCTSConfig(
             num_simulations=agent.simulations,
@@ -262,6 +296,23 @@ class AgentService:
         actor = int(observation["current_player"])
         if agent.type == AgentType.HUMAN:
             raise ValueError("Cannot select AI action for human agent.")
+        if agent.type == AgentType.HEURISTIC:
+            bot = make_heuristic_bot(
+                name=agent.heuristic_bot_name,
+                seed=self._heuristic_seed(observation),
+                epsilon=agent.heuristic_bot_epsilon,
+            )
+            action_id = int(bot.select_action(observation, legal_actions))
+            return AIActionResult(
+                actor=actor,
+                action_id=action_id,
+                macro_action="DECISION_STEP",
+                position=-1,
+                root_value=None,
+                visit_counts=None,
+                q_values=None,
+                policy_target=None,
+            )
 
         cfg = MCTSConfig(
             num_simulations=agent.simulations,

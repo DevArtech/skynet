@@ -3,7 +3,7 @@ import type { FormEvent } from 'react'
 import './App.css'
 
 type GameMode = 'human_vs_ai' | 'ai_vs_ai'
-type AgentType = 'human' | 'baseline' | 'belief'
+type AgentType = 'human' | 'baseline' | 'belief' | 'heuristic'
 
 type AgentConfig = {
   type: AgentType
@@ -11,6 +11,8 @@ type AgentConfig = {
   simulations: number
   device: string
   ablate_belief_head: boolean
+  heuristic_bot_name: string
+  heuristic_bot_epsilon: number
 }
 
 type LegalAction = {
@@ -79,6 +81,14 @@ type HumanSource = 'deck' | 'discard'
 type DeckDecision = 'keep' | 'discard'
 const ACTION_HISTORY_UNKNOWN = -127
 const UNKNOWN_VALUE = -99
+const HEURISTIC_BOT_OPTIONS = [
+  'greedy_value_replacement',
+  'information_first_flip',
+  'column_hunter',
+  'risk_aware_unknown_replacement',
+  'end_round_aggro',
+  'anti_discard',
+] as const
 
 function cardTone(value: number): { bg: string; fg: string } {
   if (value <= -1) return { bg: '#1f4e8c', fg: '#ffffff' }
@@ -149,6 +159,8 @@ function initialAgents(numPlayers: number, mode: GameMode): AgentConfig[] {
     simulations: 32,
     device: 'cpu',
     ablate_belief_head: false,
+    heuristic_bot_name: 'greedy_value_replacement',
+    heuristic_bot_epsilon: 0.02,
   }))
 }
 
@@ -189,6 +201,7 @@ function App() {
       const agentType = agents[playerIdx]?.type
       if (agentType === 'belief') return `Belief (P${playerIdx + 1})`
       if (agentType === 'baseline') return `Baseline (P${playerIdx + 1})`
+      if (agentType === 'heuristic') return `Heuristic (P${playerIdx + 1})`
       if (agentType === 'human') return `Human (P${playerIdx + 1})`
       return `Player ${playerIdx + 1}`
     },
@@ -308,6 +321,8 @@ function App() {
           simulations: 32,
           device: 'cpu',
           ablate_belief_head: false,
+          heuristic_bot_name: 'greedy_value_replacement',
+          heuristic_bot_epsilon: 0.02,
         }
       })
       if (nextMode === 'human_vs_ai') {
@@ -716,8 +731,52 @@ function App() {
                   {mode === 'human_vs_ai' && idx === 0 ? null : <option value="human">Human</option>}
                   <option value="baseline">Baseline MuZero</option>
                   <option value="belief">Belief MuZero</option>
+                  <option value="heuristic">Heuristic Bot</option>
                 </select>
               </label>
+              {agent.type === 'heuristic' ? (
+                <>
+                  <label>
+                    Heuristic Bot
+                    <select
+                      value={agent.heuristic_bot_name}
+                      onChange={(event) => {
+                        const nextName = event.target.value
+                        setAgents((prev) => {
+                          const clone = [...prev]
+                          clone[idx] = { ...clone[idx], heuristic_bot_name: nextName }
+                          return clone
+                        })
+                      }}
+                    >
+                      {HEURISTIC_BOT_OPTIONS.map((name) => (
+                        <option value={name} key={name}>
+                          {name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Heuristic Epsilon
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={agent.heuristic_bot_epsilon}
+                      onChange={(event) => {
+                        const nextEps = Number(event.target.value)
+                        setAgents((prev) => {
+                          const clone = [...prev]
+                          clone[idx] = { ...clone[idx], heuristic_bot_epsilon: nextEps }
+                          return clone
+                        })
+                      }}
+                    />
+                  </label>
+                </>
+              ) : null}
+              {agent.type === 'heuristic' ? null : (
               <label>
                 Checkpoint (optional)
                 <input
@@ -734,6 +793,7 @@ function App() {
                   }}
                 />
               </label>
+              )}
               <label>
                 Simulations
                 <input
@@ -741,6 +801,7 @@ function App() {
                   min={1}
                   max={400}
                   value={agent.simulations}
+                  disabled={agent.type === 'heuristic'}
                   onChange={(event) => {
                     const nextSims = Number(event.target.value)
                     setAgents((prev) => {
