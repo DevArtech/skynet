@@ -23,6 +23,7 @@ from muzero_train import (
     generate_self_play_episode,
     train_step,
 )
+from heuristic_bots import BOT_REGISTRY, make_heuristic_bot
 from skyjo_decision_env import DECISION_ACTION_SPACE, SkyjoDecisionEnv
 from skyjo_env import SkyjoEnv
 
@@ -98,15 +99,118 @@ def _build_history_template() -> dict[str, list[float]]:
         "selfplay_terminated_fraction": [],
         "selfplay_policy_entropy": [],
         "selfplay_root_value": [],
+        "selfplay_phase_choose_source_deck_rate": [],
+        "selfplay_phase_choose_source_discard_rate": [],
+        "selfplay_phase_keep_or_discard_keep_rate": [],
+        "selfplay_phase_keep_or_discard_discard_rate": [],
+        "selfplay_phase_choose_position_known_rate": [],
+        "selfplay_phase_choose_position_unknown_rate": [],
         "selfplay_num_simulations": [],
         "selfplay_root_dirichlet_alpha": [],
         "selfplay_root_exploration_fraction": [],
-        "eval_mean_return_p0": [],
+        "selfplay_vs_bot_fraction": [],
+        "selfplay_vs_checkpoint_fraction": [],
+        "eval_mean_score_p0": [],
+        "eval_mean_score_p1": [],
+        "eval_mean_score_diff_p0_minus_p1": [],
+        "eval_score_diff_p25": [],
+        "eval_score_diff_p50": [],
+        "eval_score_diff_p75": [],
         "eval_win_rate_p0": [],
         "eval_tie_rate": [],
         "eval_nontrunc_tie_rate": [],
         "eval_mean_episode_length": [],
         "eval_truncation_rate": [],
+        "eval_bots_mean_score_diff_p0_minus_p1": [],
+        "eval_bots_win_rate_p0": [],
+    }
+
+
+def _safe_rate(numerator: float, denominator: float) -> float:
+    if denominator <= 0.0:
+        return float("nan")
+    return float(numerator / denominator)
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    clamped = max(0.0, min(1.0, float(q)))
+    pos = clamped * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    weight = pos - lo
+    return float((1.0 - weight) * ordered[lo] + weight * ordered[hi])
+
+
+def _observer_card_visible(obs: dict[str, Any], pos: int) -> bool | None:
+    tokens = obs.get("tokens", {})
+    board_tokens = tokens.get("board_tokens")
+    if not isinstance(board_tokens, list):
+        return None
+    current_player = obs.get("current_player")
+    if not isinstance(current_player, int):
+        return None
+    for token in board_tokens:
+        if (
+            isinstance(token, list)
+            and len(token) >= 3
+            and int(token[0]) == current_player
+            and int(token[1]) == pos
+        ):
+            return bool(int(token[2]) == 1)
+    return None
+
+
+def _decision_phase_action_rates(steps: list[Any]) -> dict[str, float]:
+    choose_source_deck = 0.0
+    choose_source_discard = 0.0
+    keep_or_discard_keep = 0.0
+    keep_or_discard_discard = 0.0
+    choose_position_known = 0.0
+    choose_position_unknown = 0.0
+
+    for step in steps:
+        obs = step.observation
+        action = int(step.action)
+        phase = obs.get("decision_phase")
+
+        if phase == "CHOOSE_SOURCE":
+            if action == 0:
+                choose_source_deck += 1.0
+            elif action == 1:
+                choose_source_discard += 1.0
+        elif phase == "KEEP_OR_DISCARD":
+            if action == 2:
+                keep_or_discard_keep += 1.0
+            elif action == 3:
+                keep_or_discard_discard += 1.0
+        elif phase == "CHOOSE_POSITION":
+            pos = action - 4
+            if 0 <= pos < 12:
+                visible = _observer_card_visible(obs, pos)
+                if visible is None:
+                    continue
+                if visible:
+                    choose_position_known += 1.0
+                else:
+                    choose_position_unknown += 1.0
+
+    choose_source_total = choose_source_deck + choose_source_discard
+    keep_or_discard_total = keep_or_discard_keep + keep_or_discard_discard
+    choose_position_total = choose_position_known + choose_position_unknown
+    return {
+        "selfplay_phase_choose_source_deck_rate": _safe_rate(choose_source_deck, choose_source_total),
+        "selfplay_phase_choose_source_discard_rate": _safe_rate(choose_source_discard, choose_source_total),
+        "selfplay_phase_keep_or_discard_keep_rate": _safe_rate(keep_or_discard_keep, keep_or_discard_total),
+        "selfplay_phase_keep_or_discard_discard_rate": _safe_rate(keep_or_discard_discard, keep_or_discard_total),
+        "selfplay_phase_choose_position_known_rate": _safe_rate(choose_position_known, choose_position_total),
+        "selfplay_phase_choose_position_unknown_rate": _safe_rate(choose_position_unknown, choose_position_total),
     }
 
 
@@ -175,7 +279,9 @@ def evaluate_model(
         root_exploration_fraction=0.0,
     )
 
-    returns: list[float] = []
+    completed_scores_p0: list[float] = []
+    completed_scores_p1: list[float] = []
+    completed_score_diffs: list[float] = []
     wins = 0
     lengths: list[int] = []
     truncations = 0
@@ -193,8 +299,6 @@ def evaluate_model(
         obs = env.reset()
         terminated = False
         step_count = 0
-        total_reward_p0 = 0.0
-
         while not terminated and (max_moves <= 0 or step_count < max_moves):
             legal_actions = env.legal_actions()
             stats = run_mcts(
@@ -204,8 +308,7 @@ def evaluate_model(
                 config=eval_cfg,
                 device=device,
             )
-            obs, rewards, terminated, _ = env.step(stats.action)
-            total_reward_p0 += float(rewards.get("player_0", 0.0))
+            obs, _, terminated, _ = env.step(stats.action)
             step_count += 1
 
         if not terminated:
@@ -218,8 +321,12 @@ def evaluate_model(
             if terminated:
                 nontrunc_tie_episodes += 1
 
-        returns.append(total_reward_p0)
         if terminated:
+            score0 = float(env.scores[0])
+            score1 = float(env.scores[1])
+            completed_scores_p0.append(score0)
+            completed_scores_p1.append(score1)
+            completed_score_diffs.append(score0 - score1)
             wins += 1.0 / float(len(winners)) if 0 in winners else 0.0
         lengths.append(step_count)
         done = ep_idx + 1
@@ -233,13 +340,121 @@ def evaluate_model(
             )
 
     return {
-        "eval_mean_return_p0": float(mean(returns) if returns else 0.0),
+        "eval_mean_score_p0": float(mean(completed_scores_p0) if completed_scores_p0 else float("nan")),
+        "eval_mean_score_p1": float(mean(completed_scores_p1) if completed_scores_p1 else float("nan")),
+        "eval_mean_score_diff_p0_minus_p1": float(mean(completed_score_diffs) if completed_score_diffs else float("nan")),
+        "eval_score_diff_p25": _percentile(completed_score_diffs, 0.25),
+        "eval_score_diff_p50": _percentile(completed_score_diffs, 0.50),
+        "eval_score_diff_p75": _percentile(completed_score_diffs, 0.75),
         "eval_win_rate_p0": float(wins / max(1.0, float(num_episodes))),
         "eval_tie_rate": float(tie_episodes / max(1, num_episodes)),
         "eval_nontrunc_tie_rate": float(nontrunc_tie_episodes / max(1, num_episodes - truncations)),
         "eval_mean_episode_length": float(mean(lengths) if lengths else 0.0),
         "eval_truncation_rate": float(truncations / max(1, num_episodes)),
     }
+
+
+def _parse_bot_names(raw: str) -> list[str]:
+    names = [token.strip().lower() for token in str(raw).split(",") if token.strip()]
+    if not names:
+        return []
+    invalid = [name for name in names if name not in BOT_REGISTRY]
+    if invalid:
+        raise ValueError(f"Unknown heuristic bot names: {invalid}. Available: {sorted(BOT_REGISTRY)}")
+    return names
+
+
+def evaluate_model_vs_heuristic_bots(
+    model: MuZeroNet,
+    bot_names: list[str],
+    episodes_per_bot: int,
+    num_simulations: int,
+    max_moves: int,
+    discount: float,
+    device: str,
+    seed_base: int,
+    env_mode: str,
+    bot_epsilon: float,
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    if not bot_names or episodes_per_bot <= 0:
+        empty = {
+            "eval_bots_mean_score_diff_p0_minus_p1": float("nan"),
+            "eval_bots_win_rate_p0": float("nan"),
+        }
+        return empty, {}
+    cfg = MCTSConfig(
+        num_simulations=num_simulations,
+        discount=discount,
+        temperature=1e-8,
+        add_exploration_noise=False,
+        root_exploration_fraction=0.0,
+    )
+    per_bot: dict[str, dict[str, float]] = {}
+    all_score_diffs: list[float] = []
+    all_wins = 0.0
+    all_games = 0
+
+    for bot_idx, bot_name in enumerate(bot_names):
+        score_diffs: list[float] = []
+        wins = 0.0
+        completed = 0
+        for ep in range(episodes_per_bot):
+            seed = seed_base + (bot_idx * 10_000) + ep
+            bot = make_heuristic_bot(bot_name, seed=seed, epsilon=bot_epsilon)
+            env: Any
+            if env_mode == "decision":
+                env = SkyjoDecisionEnv(num_players=2, seed=seed, setup_mode="auto")
+            else:
+                env = SkyjoEnv(num_players=2, seed=seed, setup_mode="auto")
+            obs = env.reset()
+            terminated = False
+            steps = 0
+            while not terminated and (max_moves <= 0 or steps < max_moves):
+                actor = int(env.current_player)
+                legal = env.legal_actions()
+                if actor == 0:
+                    stats = run_mcts(
+                        model=model,
+                        observation=obs,
+                        legal_action_ids=legal,
+                        config=cfg,
+                        device=device,
+                    )
+                    action = int(stats.action)
+                else:
+                    action = int(bot.select_action(obs, legal))
+                obs, _, terminated, _ = env.step(action)
+                steps += 1
+            if not terminated:
+                continue
+            score0 = float(env.scores[0])
+            score1 = float(env.scores[1])
+            score_diffs.append(score0 - score1)
+            min_score = min(env.scores)
+            winners = [i for i, score in enumerate(env.scores) if score == min_score]
+            wins += 1.0 / float(len(winners)) if 0 in winners else 0.0
+            completed += 1
+        if completed > 0:
+            per_bot[bot_name] = {
+                "games": float(completed),
+                "mean_score_diff_p0_minus_p1": float(mean(score_diffs)),
+                "win_rate_p0": float(wins / completed),
+            }
+            all_score_diffs.extend(score_diffs)
+            all_wins += wins
+            all_games += completed
+        else:
+            per_bot[bot_name] = {
+                "games": 0.0,
+                "mean_score_diff_p0_minus_p1": float("nan"),
+                "win_rate_p0": float("nan"),
+            }
+
+    overall = {
+        "eval_bots_mean_score_diff_p0_minus_p1": float(mean(all_score_diffs) if all_score_diffs else float("nan")),
+        "eval_bots_win_rate_p0": float(all_wins / all_games) if all_games > 0 else float("nan"),
+    }
+    return overall, per_bot
 
 
 def _plot_single_series(x: list[int], y: list[float], title: str, y_label: str, out_path: Path) -> None:
@@ -275,12 +490,29 @@ def _save_graphs(history: dict[str, list[float]], graph_dir: Path) -> None:
         ("selfplay_terminated_fraction", "Self-Play Termination Fraction", "Fraction", "training_terminated_fraction.png"),
         ("selfplay_policy_entropy", "Self-Play Policy Entropy", "Entropy", "diagnostics_policy_entropy.png"),
         ("selfplay_root_value", "Self-Play Root Value", "Scalar", "diagnostics_root_value.png"),
-        ("eval_mean_return_p0", "Eval Mean Return (Player 0)", "Return", "testing_eval_mean_return_p0.png"),
+        ("eval_mean_score_p0", "Eval Mean Final Score (Player 0)", "Score", "testing_eval_mean_score_p0.png"),
+        ("eval_mean_score_p1", "Eval Mean Final Score (Player 1)", "Score", "testing_eval_mean_score_p1.png"),
+        (
+            "eval_mean_score_diff_p0_minus_p1",
+            "Eval Mean Score Diff (P0 - P1)",
+            "Score Diff",
+            "testing_eval_mean_score_diff_p0_minus_p1.png",
+        ),
+        ("eval_score_diff_p25", "Eval Score Diff P25", "Score Diff", "testing_eval_score_diff_p25.png"),
+        ("eval_score_diff_p50", "Eval Score Diff P50 (Median)", "Score Diff", "testing_eval_score_diff_p50.png"),
+        ("eval_score_diff_p75", "Eval Score Diff P75", "Score Diff", "testing_eval_score_diff_p75.png"),
         ("eval_win_rate_p0", "Eval Win Rate (Player 0)", "Win Rate", "testing_eval_win_rate_p0.png"),
         ("eval_tie_rate", "Eval Tie Rate", "Rate", "testing_eval_tie_rate.png"),
         ("eval_nontrunc_tie_rate", "Eval Tie Rate (Non-Truncated)", "Rate", "testing_eval_nontrunc_tie_rate.png"),
         ("eval_mean_episode_length", "Eval Episode Length", "Steps", "testing_eval_episode_length.png"),
         ("eval_truncation_rate", "Eval Truncation Rate", "Rate", "testing_eval_truncation_rate.png"),
+        (
+            "eval_bots_mean_score_diff_p0_minus_p1",
+            "Eval vs Heuristic Bots: Mean Score Diff (P0 - P1)",
+            "Score Diff",
+            "testing_eval_bots_mean_score_diff_p0_minus_p1.png",
+        ),
+        ("eval_bots_win_rate_p0", "Eval vs Heuristic Bots: Win Rate (P0)", "Win Rate", "testing_eval_bots_win_rate_p0.png"),
     ]
 
     for key, title, y_label, filename in graph_specs:
@@ -312,6 +544,7 @@ def main() -> None:
     parser.add_argument("--train-steps-per-iter", type=int, default=64)
     parser.add_argument("--eval-every", type=int, default=20)
     parser.add_argument("--eval-episodes", type=int, default=200)
+    parser.add_argument("--eval-bot-episodes-per-bot", type=int, default=20)
     parser.add_argument("--selfplay-sims", type=int, default=50)
     parser.add_argument("--selfplay-sims-mid", type=int, default=100)
     parser.add_argument("--selfplay-sims-final", type=int, default=200)
@@ -325,6 +558,14 @@ def main() -> None:
     parser.add_argument("--dirichlet-switch-iter", type=int, default=200)
     parser.add_argument("--opponent-pool-size", type=int, default=10)
     parser.add_argument("--opponent-latest-prob", type=float, default=0.7)
+    parser.add_argument("--opponent-checkpoint-fraction", type=float, default=0.2)
+    parser.add_argument("--heuristic-bot-fraction", type=float, default=0.3)
+    parser.add_argument(
+        "--heuristic-bot-names",
+        type=str,
+        default="greedy_value_replacement,information_first_flip,column_hunter,risk_aware_unknown_replacement,end_round_aggro,anti_discard",
+    )
+    parser.add_argument("--heuristic-bot-epsilon", type=float, default=0.02)
     parser.add_argument("--opponent-snapshot-every", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--unroll-steps", type=int, default=5)
@@ -340,8 +581,8 @@ def main() -> None:
     parser.add_argument(
         "--time-penalty-per-step",
         type=float,
-        default=0.0002,
-        help="Subtract this amount from the acting player's reward every step to encourage shorter games.",
+        default=0.0,
+        help="Subtract this amount from the acting player's reward every step.",
     )
     parser.add_argument(
         "--time-penalty-max-per-episode",
@@ -380,6 +621,8 @@ def main() -> None:
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    bot_names = _parse_bot_names(args.heuristic_bot_names)
+    heuristic_bots = [make_heuristic_bot(name, seed=args.seed + 10_000 + i, epsilon=args.heuristic_bot_epsilon) for i, name in enumerate(bot_names)]
 
     output_dir = Path(args.output_dir)
     graph_dir = output_dir / "graphs"
@@ -471,6 +714,9 @@ def main() -> None:
         terminated_flags: list[float] = []
         policy_entropies: list[float] = []
         root_values: list[float] = []
+        decision_phase_steps: list[Any] = []
+        bot_opponent_episodes = 0
+        checkpoint_opponent_episodes = 0
         selfplay_start = time.perf_counter()
 
         for ep_idx in range(args.selfplay_episodes_per_iter):
@@ -481,12 +727,19 @@ def main() -> None:
                 env_factory = lambda s=env_seed: SkyjoEnv(num_players=2, seed=s, setup_mode="auto")
 
             selected_opponent: MuZeroNet | None = None
-            if args.opponent_pool_size > 0 and opponent_pool:
-                use_latest = random.random() < max(0.0, min(1.0, args.opponent_latest_prob))
-                if not use_latest:
+            opponent_action_selector: Any = None
+            use_bot = bool(heuristic_bots) and (random.random() < max(0.0, min(1.0, args.heuristic_bot_fraction)))
+            if use_bot:
+                bot = random.choice(heuristic_bots)
+                opponent_action_selector = lambda o, legal, actor, b=bot: int(b.select_action(o, legal))
+                bot_opponent_episodes += 1
+            elif args.opponent_pool_size > 0 and opponent_pool:
+                use_checkpoint = random.random() < max(0.0, min(1.0, args.opponent_checkpoint_fraction))
+                if use_checkpoint:
                     snapshot = random.choice(opponent_pool)
                     opponent_model.load_state_dict(snapshot)
                     selected_opponent = opponent_model
+                    checkpoint_opponent_episodes += 1
 
             learner_player_id = random.randint(0, 1)
             episode = generate_self_play_episode(
@@ -500,6 +753,7 @@ def main() -> None:
                 time_penalty_per_step=train_cfg.time_penalty_per_step,
                 time_penalty_max_per_episode=train_cfg.time_penalty_max_per_episode,
                 truncation_penalty=train_cfg.truncation_penalty,
+                opponent_action_selector=opponent_action_selector,
             )
             replay.add_episode(episode)
             elapsed = time.perf_counter() - selfplay_start
@@ -515,6 +769,7 @@ def main() -> None:
             for step in episode.steps:
                 policy_entropies.append(_entropy(step.policy_target))
                 root_values.append(step.root_value)
+                decision_phase_steps.append(step)
 
         losses = {"loss_total": 0.0, "loss_policy": 0.0, "loss_value": 0.0, "loss_reward": 0.0, "grad_norm": 0.0}
         effective_train_steps = 0
@@ -531,12 +786,19 @@ def main() -> None:
                 losses[k] /= effective_train_steps
 
         eval_metrics = {
-            "eval_mean_return_p0": float("nan"),
+            "eval_mean_score_p0": float("nan"),
+            "eval_mean_score_p1": float("nan"),
+            "eval_mean_score_diff_p0_minus_p1": float("nan"),
+            "eval_score_diff_p25": float("nan"),
+            "eval_score_diff_p50": float("nan"),
+            "eval_score_diff_p75": float("nan"),
             "eval_win_rate_p0": float("nan"),
             "eval_tie_rate": float("nan"),
             "eval_nontrunc_tie_rate": float("nan"),
             "eval_mean_episode_length": float("nan"),
             "eval_truncation_rate": float("nan"),
+            "eval_bots_mean_score_diff_p0_minus_p1": float("nan"),
+            "eval_bots_win_rate_p0": float("nan"),
         }
         if iteration % args.eval_every == 0:
             print(f"[eval baseline] starting iteration {iteration:04d} with {args.eval_episodes} episodes")
@@ -550,6 +812,23 @@ def main() -> None:
                 seed_base=args.seed * 1000 + iteration * 100,
                 env_mode=args.env_mode,
             )
+            bot_overall, bot_detail = evaluate_model_vs_heuristic_bots(
+                model=model,
+                bot_names=bot_names,
+                episodes_per_bot=args.eval_bot_episodes_per_bot,
+                num_simulations=args.eval_sims,
+                max_moves=args.eval_max_moves,
+                discount=args.discount,
+                device=args.device,
+                seed_base=args.seed * 1_000_000 + iteration * 1_000,
+                env_mode=args.env_mode,
+                bot_epsilon=args.heuristic_bot_epsilon,
+            )
+            eval_metrics.update(bot_overall)
+            bot_eval_dir = output_dir / "bot_eval"
+            _ensure_dir(bot_eval_dir)
+            with (bot_eval_dir / f"iter_{iteration:04d}.json").open("w", encoding="utf-8") as f:
+                json.dump({"iteration": iteration, "overall": bot_overall, "per_bot": bot_detail}, f, indent=2)
 
         history["iteration"].append(float(iteration))
         history["loss_total"].append(float(losses["loss_total"]))
@@ -562,15 +841,47 @@ def main() -> None:
         history["selfplay_terminated_fraction"].append(float(mean(terminated_flags) if terminated_flags else 0.0))
         history["selfplay_policy_entropy"].append(float(mean(policy_entropies) if policy_entropies else 0.0))
         history["selfplay_root_value"].append(float(mean(root_values) if root_values else 0.0))
+        phase_rates = _decision_phase_action_rates(decision_phase_steps)
+        history["selfplay_phase_choose_source_deck_rate"].append(
+            float(phase_rates["selfplay_phase_choose_source_deck_rate"])
+        )
+        history["selfplay_phase_choose_source_discard_rate"].append(
+            float(phase_rates["selfplay_phase_choose_source_discard_rate"])
+        )
+        history["selfplay_phase_keep_or_discard_keep_rate"].append(
+            float(phase_rates["selfplay_phase_keep_or_discard_keep_rate"])
+        )
+        history["selfplay_phase_keep_or_discard_discard_rate"].append(
+            float(phase_rates["selfplay_phase_keep_or_discard_discard_rate"])
+        )
+        history["selfplay_phase_choose_position_known_rate"].append(
+            float(phase_rates["selfplay_phase_choose_position_known_rate"])
+        )
+        history["selfplay_phase_choose_position_unknown_rate"].append(
+            float(phase_rates["selfplay_phase_choose_position_unknown_rate"])
+        )
         history["selfplay_num_simulations"].append(float(selfplay_sims))
         history["selfplay_root_dirichlet_alpha"].append(float(dirichlet_alpha))
         history["selfplay_root_exploration_fraction"].append(float(dirichlet_frac))
-        history["eval_mean_return_p0"].append(float(eval_metrics["eval_mean_return_p0"]))
+        history["selfplay_vs_bot_fraction"].append(float(bot_opponent_episodes / max(1, args.selfplay_episodes_per_iter)))
+        history["selfplay_vs_checkpoint_fraction"].append(
+            float(checkpoint_opponent_episodes / max(1, args.selfplay_episodes_per_iter))
+        )
+        history["eval_mean_score_p0"].append(float(eval_metrics["eval_mean_score_p0"]))
+        history["eval_mean_score_p1"].append(float(eval_metrics["eval_mean_score_p1"]))
+        history["eval_mean_score_diff_p0_minus_p1"].append(float(eval_metrics["eval_mean_score_diff_p0_minus_p1"]))
+        history["eval_score_diff_p25"].append(float(eval_metrics["eval_score_diff_p25"]))
+        history["eval_score_diff_p50"].append(float(eval_metrics["eval_score_diff_p50"]))
+        history["eval_score_diff_p75"].append(float(eval_metrics["eval_score_diff_p75"]))
         history["eval_win_rate_p0"].append(float(eval_metrics["eval_win_rate_p0"]))
         history["eval_tie_rate"].append(float(eval_metrics["eval_tie_rate"]))
         history["eval_nontrunc_tie_rate"].append(float(eval_metrics["eval_nontrunc_tie_rate"]))
         history["eval_mean_episode_length"].append(float(eval_metrics["eval_mean_episode_length"]))
         history["eval_truncation_rate"].append(float(eval_metrics["eval_truncation_rate"]))
+        history["eval_bots_mean_score_diff_p0_minus_p1"].append(
+            float(eval_metrics["eval_bots_mean_score_diff_p0_minus_p1"])
+        )
+        history["eval_bots_win_rate_p0"].append(float(eval_metrics["eval_bots_win_rate_p0"]))
 
         _save_metrics(history, output_dir=output_dir)
         _save_graphs(history, graph_dir=graph_dir)

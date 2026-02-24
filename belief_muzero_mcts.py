@@ -132,6 +132,22 @@ def _infer_next_player_and_phase(
     return (current_player_id + 1) % max(1, num_players), decision_phase_id
 
 
+def _phase_legal_actions(decision_phase_id: int | None, action_space_size: int) -> list[int]:
+    if decision_phase_id is None:
+        return list(range(action_space_size))
+    phase = int(decision_phase_id)
+    if phase == int(DecisionPhase.SETUP_REVEAL):
+        return [a for a in range(int(DecisionAction.CHOOSE_POS_BASE), action_space_size)]
+    if phase == int(DecisionPhase.CHOOSE_SOURCE):
+        # In tree search we allow both; discard availability depends on latent deck/discard state.
+        return [int(DecisionAction.CHOOSE_DECK), int(DecisionAction.CHOOSE_DISCARD)]
+    if phase == int(DecisionPhase.KEEP_OR_DISCARD):
+        return [int(DecisionAction.KEEP_DRAWN), int(DecisionAction.DISCARD_DRAWN)]
+    if phase == int(DecisionPhase.CHOOSE_POSITION):
+        return [a for a in range(int(DecisionAction.CHOOSE_POS_BASE), action_space_size)]
+    return list(range(action_space_size))
+
+
 def run_belief_mcts(
     model: BeliefAwareMuZeroNet,
     observation: dict[str, Any],
@@ -235,7 +251,8 @@ def run_belief_mcts(
                         node.reward = model.reward_support.logits_to_scalar(rec.reward_logits[0]).item()
                         value = model.value_support.logits_to_scalar(rec.value_logits[0]).item()
                         probs = torch.softmax(rec.policy_logits[0], dim=-1)
-                for action_id in range(action_space_size):
+                legal_actions = _phase_legal_actions(next_phase_id, action_space_size)
+                for action_id in legal_actions:
                     node.children[action_id] = _Node(
                         prior=float(probs[action_id].item()),
                         current_player_id=next_player_id,

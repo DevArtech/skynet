@@ -24,6 +24,7 @@ from belief_muzero_train import (
     generate_belief_self_play_episode,
     train_belief_step,
 )
+from heuristic_bots import BOT_REGISTRY, make_heuristic_bot
 from muzero_mcts import MCTSConfig
 from skyjo_decision_env import DECISION_ACTION_SPACE, SkyjoDecisionEnv
 from skyjo_env import SkyjoEnv
@@ -119,16 +120,26 @@ def _build_history_template() -> dict[str, list[float]]:
         "selfplay_num_simulations": [],
         "selfplay_root_dirichlet_alpha": [],
         "selfplay_root_exploration_fraction": [],
+        "selfplay_vs_bot_fraction": [],
+        "selfplay_vs_checkpoint_fraction": [],
         "winner_loss_weight": [],
         "rank_loss_weight": [],
-        "eval_mean_return_p0": [],
+        "eval_mean_score_p0": [],
+        "eval_mean_score_p1": [],
+        "eval_mean_score_diff_p0_minus_p1": [],
+        "eval_score_diff_p25": [],
+        "eval_score_diff_p50": [],
+        "eval_score_diff_p75": [],
         "eval_win_rate_p0": [],
+        "eval_tie_rate": [],
         "eval_mean_episode_length": [],
         "eval_truncation_rate": [],
-        "eval_value_brier": [],
-        "eval_value_ece": [],
+        "eval_bots_mean_score_diff_p0_minus_p1": [],
+        "eval_bots_win_rate_p0": [],
+        "eval_value_mse": [],
+        "eval_value_mae": [],
         "eval_value_pred_mean": [],
-        "eval_value_outcome_mean": [],
+        "eval_value_target_mean": [],
     }
 
 
@@ -158,6 +169,32 @@ def _trim_history(history: dict[str, list[float]], target_rows: int) -> None:
             history[key].extend([float("nan")] * (row_count - len(values)))
 
 
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(float(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    clamped = max(0.0, min(1.0, float(q)))
+    pos = clamped * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return ordered[lo]
+    weight = pos - lo
+    return float((1.0 - weight) * ordered[lo] + weight * ordered[hi])
+
+
+def _parse_bot_names(raw: str) -> list[str]:
+    names = [token.strip().lower() for token in str(raw).split(",") if token.strip()]
+    if not names:
+        return []
+    invalid = [name for name in names if name not in BOT_REGISTRY]
+    if invalid:
+        raise ValueError(f"Unknown heuristic bot names: {invalid}. Available: {sorted(BOT_REGISTRY)}")
+    return names
+
+
 def _rebuild_opponent_pool(
     checkpoint_dir: Path,
     max_pool_size: int,
@@ -177,70 +214,6 @@ def _rebuild_opponent_pool(
         if isinstance(model_state, dict):
             pool.append(copy.deepcopy(model_state))
     return pool
-
-
-def _compute_calibration_bins(
-    predictions: list[float],
-    outcomes: list[int],
-    num_bins: int = 10,
-) -> list[dict[str, float]]:
-    bins: list[dict[str, float]] = []
-    if not predictions or not outcomes:
-        return bins
-
-    for b in range(num_bins):
-        lo = b / num_bins
-        hi = (b + 1) / num_bins
-        in_bin: list[tuple[float, int]] = []
-        for p, y in zip(predictions, outcomes, strict=False):
-            if b == num_bins - 1:
-                if lo <= p <= hi:
-                    in_bin.append((p, y))
-            elif lo <= p < hi:
-                in_bin.append((p, y))
-
-        count = len(in_bin)
-        if count == 0:
-            bins.append(
-                {
-                    "bin_index": float(b),
-                    "bin_start": float(lo),
-                    "bin_end": float(hi),
-                    "count": 0.0,
-                    "mean_pred": float("nan"),
-                    "empirical_win_rate": float("nan"),
-                    "abs_gap": float("nan"),
-                }
-            )
-            continue
-
-        mean_pred = float(sum(p for p, _ in in_bin) / count)
-        empirical = float(sum(y for _, y in in_bin) / count)
-        bins.append(
-            {
-                "bin_index": float(b),
-                "bin_start": float(lo),
-                "bin_end": float(hi),
-                "count": float(count),
-                "mean_pred": mean_pred,
-                "empirical_win_rate": empirical,
-                "abs_gap": float(abs(empirical - mean_pred)),
-            }
-        )
-    return bins
-
-
-def _compute_ece(calibration_bins: list[dict[str, float]]) -> float:
-    total = sum(int(bin_row["count"]) for bin_row in calibration_bins)
-    if total <= 0:
-        return float("nan")
-    weighted_gap = 0.0
-    for bin_row in calibration_bins:
-        count = int(bin_row["count"])
-        if count <= 0:
-            continue
-        weighted_gap += (count / total) * float(bin_row["abs_gap"])
-    return float(weighted_gap)
 
 
 def _save_metrics(history: dict[str, list[float]], output_dir: Path) -> None:
@@ -287,64 +260,41 @@ def _save_graphs(history: dict[str, list[float]], graph_dir: Path) -> None:
         ("replay_steps", "Replay Steps", "Steps", "diagnostics_replay_steps.png"),
         ("selfplay_policy_entropy", "Self-Play Policy Entropy", "Entropy", "diagnostics_policy_entropy.png"),
         ("selfplay_root_value", "Self-Play Root Value", "Scalar", "diagnostics_root_value.png"),
-        ("eval_mean_return_p0", "Eval Mean Return (P0)", "Return", "testing_eval_mean_return_p0.png"),
+        ("selfplay_vs_bot_fraction", "Self-Play vs Heuristic Bot Fraction", "Fraction", "diagnostics_selfplay_vs_bot_fraction.png"),
+        (
+            "selfplay_vs_checkpoint_fraction",
+            "Self-Play vs Checkpoint Opponent Fraction",
+            "Fraction",
+            "diagnostics_selfplay_vs_checkpoint_fraction.png",
+        ),
+        ("eval_mean_score_p0", "Eval Mean Final Score (P0)", "Score", "testing_eval_mean_score_p0.png"),
+        ("eval_mean_score_p1", "Eval Mean Final Score (P1)", "Score", "testing_eval_mean_score_p1.png"),
+        (
+            "eval_mean_score_diff_p0_minus_p1",
+            "Eval Mean Score Diff (P0 - P1)",
+            "Score Diff",
+            "testing_eval_mean_score_diff_p0_minus_p1.png",
+        ),
+        ("eval_score_diff_p25", "Eval Score Diff P25", "Score Diff", "testing_eval_score_diff_p25.png"),
+        ("eval_score_diff_p50", "Eval Score Diff P50 (Median)", "Score Diff", "testing_eval_score_diff_p50.png"),
+        ("eval_score_diff_p75", "Eval Score Diff P75", "Score Diff", "testing_eval_score_diff_p75.png"),
         ("eval_win_rate_p0", "Eval Win Rate (P0)", "Win Rate", "testing_eval_win_rate_p0.png"),
+        ("eval_tie_rate", "Eval Tie Rate", "Rate", "testing_eval_tie_rate.png"),
         ("eval_mean_episode_length", "Eval Episode Length", "Steps", "testing_eval_episode_length.png"),
         ("eval_truncation_rate", "Eval Truncation Rate", "Rate", "testing_eval_truncation_rate.png"),
-        ("eval_value_brier", "Eval Value Brier Score", "Brier", "testing_eval_value_brier.png"),
-        ("eval_value_ece", "Eval Value ECE (10 bins)", "ECE", "testing_eval_value_ece.png"),
+        (
+            "eval_bots_mean_score_diff_p0_minus_p1",
+            "Eval vs Heuristic Bots: Mean Score Diff (P0 - P1)",
+            "Score Diff",
+            "testing_eval_bots_mean_score_diff_p0_minus_p1.png",
+        ),
+        ("eval_bots_win_rate_p0", "Eval vs Heuristic Bots: Win Rate (P0)", "Win Rate", "testing_eval_bots_win_rate_p0.png"),
+        ("eval_value_mse", "Eval Value MSE", "MSE", "testing_eval_value_mse.png"),
+        ("eval_value_mae", "Eval Value MAE", "MAE", "testing_eval_value_mae.png"),
     ]
     for key, title, ylabel, filename in specs:
         if key in history and len(history[key]) == len(x):
             _plot_series(x, history[key], title, ylabel, graph_dir / filename)
-
-
-def _save_calibration(
-    output_dir: Path,
-    iteration: int,
-    calibration_bins: list[dict[str, float]],
-) -> None:
-    calib_dir = output_dir / "calibration"
-    _ensure_dir(calib_dir)
-
-    payload: dict[str, Any] = {"iteration": iteration, "bins": calibration_bins}
-    with (calib_dir / "latest_value_calibration.json").open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-    with (calib_dir / f"value_calibration_iter_{iteration}.json").open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
-
-    fieldnames = ["bin_index", "bin_start", "bin_end", "count", "mean_pred", "empirical_win_rate", "abs_gap"]
-    with (calib_dir / "latest_value_calibration.csv").open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in calibration_bins:
-            writer.writerow(row)
-
-    with (calib_dir / f"value_calibration_iter_{iteration}.csv").open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in calibration_bins:
-            writer.writerow(row)
-
-    x = [row["mean_pred"] for row in calibration_bins if math.isfinite(float(row["mean_pred"]))]
-    y = [row["empirical_win_rate"] for row in calibration_bins if math.isfinite(float(row["empirical_win_rate"]))]
-    if not x or not y:
-        return
-
-    plt.figure(figsize=(5, 5))
-    plt.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", linewidth=1.25, alpha=0.8, label="Perfect calibration")
-    plt.plot(x, y, marker="o", linewidth=2.0, label="Belief value calibration")
-    plt.xlim(0.0, 1.0)
-    plt.ylim(0.0, 1.0)
-    plt.xlabel("Predicted win probability")
-    plt.ylabel("Empirical win rate")
-    plt.title("Belief Value Calibration")
-    plt.grid(alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(calib_dir / "latest_value_calibration.png", dpi=140)
-    plt.savefig(calib_dir / f"value_calibration_iter_{iteration}.png", dpi=140)
-    plt.close()
 
 
 def evaluate_belief_model(
@@ -357,12 +307,15 @@ def evaluate_belief_model(
     env_mode: str,
 ) -> dict[str, float]:
     cfg = MCTSConfig(num_simulations=sims, temperature=1e-8, add_exploration_noise=False, root_exploration_fraction=0.0)
-    wins = 0
+    wins = 0.0
+    ties = 0
     lengths: list[int] = []
     truncations = 0
-    returns: list[float] = []
-    predicted_win_probs: list[float] = []
-    realized_outcomes: list[int] = []
+    completed_scores_p0: list[float] = []
+    completed_scores_p1: list[float] = []
+    completed_score_diffs: list[float] = []
+    predicted_values: list[float] = []
+    target_values: list[float] = []
     eval_start = time.perf_counter()
     progress_every = max(1, episodes // 4)
 
@@ -374,7 +327,6 @@ def evaluate_belief_model(
         obs = env.reset()
         terminated = False
         steps = 0
-        total_reward_p0 = 0.0
         episode_predictions: list[tuple[int, float]] = []
         while not terminated and (max_moves <= 0 or steps < max_moves):
             actor = int(env.current_player)
@@ -386,20 +338,29 @@ def evaluate_belief_model(
                 config=cfg,
                 device=device,
             )
-            clipped = max(0.0, min(1.0, float(stats.root_value)))
-            episode_predictions.append((actor, clipped))
-            obs, rewards, terminated, _ = env.step(stats.action)
-            total_reward_p0 += float(rewards.get("player_0", 0.0))
+            episode_predictions.append((actor, float(stats.root_value)))
+            obs, _, terminated, _ = env.step(stats.action)
             steps += 1
         if not terminated:
             truncations += 1
-        winner = min(range(env.num_players), key=lambda p: env.scores[p])
-        wins += int(winner == 0)
         lengths.append(steps)
-        returns.append(total_reward_p0)
-        for actor, pred in episode_predictions:
-            predicted_win_probs.append(pred)
-            realized_outcomes.append(int(winner == actor))
+        if terminated:
+            score0 = float(env.scores[0])
+            score1 = float(env.scores[1])
+            completed_scores_p0.append(score0)
+            completed_scores_p1.append(score1)
+            completed_score_diffs.append(score0 - score1)
+            min_score = min(env.scores)
+            winners = [i for i, s in enumerate(env.scores) if s == min_score]
+            if len(winners) > 1:
+                ties += 1
+            wins += 1.0 / float(len(winners)) if 0 in winners else 0.0
+            for actor, pred in episode_predictions:
+                own = float(env.scores[actor])
+                others = [float(env.scores[i]) for i in range(env.num_players) if i != actor]
+                opp_mean = float(sum(others) / max(1, len(others)))
+                predicted_values.append(pred)
+                target_values.append(opp_mean - own)
         done = e + 1
         if done % progress_every == 0 or done == episodes:
             elapsed = time.perf_counter() - eval_start
@@ -410,25 +371,118 @@ def evaluate_belief_model(
                 f"mean_len={mean(lengths):.1f}"
             )
 
-    calibration_bins = _compute_calibration_bins(predictions=predicted_win_probs, outcomes=realized_outcomes, num_bins=10)
-    brier = float("nan")
-    if predicted_win_probs and realized_outcomes:
-        brier = float(
-            sum((p - y) ** 2 for p, y in zip(predicted_win_probs, realized_outcomes, strict=False))
-            / len(predicted_win_probs)
-        )
+    value_mse = float("nan")
+    value_mae = float("nan")
+    if predicted_values and target_values:
+        sq = [(p - y) ** 2 for p, y in zip(predicted_values, target_values, strict=False)]
+        ab = [abs(p - y) for p, y in zip(predicted_values, target_values, strict=False)]
+        value_mse = float(sum(sq) / len(sq))
+        value_mae = float(sum(ab) / len(ab))
 
     return {
-        "eval_mean_return_p0": float(mean(returns) if returns else 0.0),
+        "eval_mean_score_p0": float(mean(completed_scores_p0) if completed_scores_p0 else float("nan")),
+        "eval_mean_score_p1": float(mean(completed_scores_p1) if completed_scores_p1 else float("nan")),
+        "eval_mean_score_diff_p0_minus_p1": float(mean(completed_score_diffs) if completed_score_diffs else float("nan")),
+        "eval_score_diff_p25": _percentile(completed_score_diffs, 0.25),
+        "eval_score_diff_p50": _percentile(completed_score_diffs, 0.50),
+        "eval_score_diff_p75": _percentile(completed_score_diffs, 0.75),
         "eval_win_rate_p0": float(wins / max(1, episodes)),
+        "eval_tie_rate": float(ties / max(1, episodes)),
         "eval_mean_episode_length": float(mean(lengths) if lengths else 0.0),
         "eval_truncation_rate": float(truncations / max(1, episodes)),
-        "eval_value_brier": brier,
-        "eval_value_ece": _compute_ece(calibration_bins),
-        "eval_value_pred_mean": float(mean(predicted_win_probs) if predicted_win_probs else float("nan")),
-        "eval_value_outcome_mean": float(mean(realized_outcomes) if realized_outcomes else float("nan")),
-        "eval_calibration_bins": calibration_bins,
+        "eval_value_mse": value_mse,
+        "eval_value_mae": value_mae,
+        "eval_value_pred_mean": float(mean(predicted_values) if predicted_values else float("nan")),
+        "eval_value_target_mean": float(mean(target_values) if target_values else float("nan")),
     }
+
+
+def evaluate_belief_vs_heuristic_bots(
+    model: BeliefAwareMuZeroNet,
+    bot_names: list[str],
+    episodes_per_bot: int,
+    sims: int,
+    max_moves: int,
+    device: str,
+    seed_base: int,
+    env_mode: str,
+    bot_epsilon: float,
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    if not bot_names or episodes_per_bot <= 0:
+        empty = {
+            "eval_bots_mean_score_diff_p0_minus_p1": float("nan"),
+            "eval_bots_win_rate_p0": float("nan"),
+        }
+        return empty, {}
+    cfg = MCTSConfig(num_simulations=sims, temperature=1e-8, add_exploration_noise=False, root_exploration_fraction=0.0)
+    per_bot: dict[str, dict[str, float]] = {}
+    all_score_diffs: list[float] = []
+    all_wins = 0.0
+    all_games = 0
+
+    for bot_idx, bot_name in enumerate(bot_names):
+        score_diffs: list[float] = []
+        wins = 0.0
+        completed = 0
+        for ep in range(episodes_per_bot):
+            seed = seed_base + (bot_idx * 10_000) + ep
+            bot = make_heuristic_bot(bot_name, seed=seed, epsilon=bot_epsilon)
+            env: Any
+            if env_mode == "decision":
+                env = SkyjoDecisionEnv(num_players=2, seed=seed, setup_mode="auto")
+            else:
+                env = SkyjoEnv(num_players=2, seed=seed, setup_mode="auto")
+            obs = env.reset()
+            terminated = False
+            steps = 0
+            while not terminated and (max_moves <= 0 or steps < max_moves):
+                actor = int(env.current_player)
+                legal = env.legal_actions()
+                if actor == 0:
+                    stats = run_belief_mcts(
+                        model=model,
+                        observation=obs,
+                        legal_action_ids=legal,
+                        ego_player_id=actor,
+                        config=cfg,
+                        device=device,
+                    )
+                    action = int(stats.action)
+                else:
+                    action = int(bot.select_action(obs, legal))
+                obs, _, terminated, _ = env.step(action)
+                steps += 1
+            if not terminated:
+                continue
+            score0 = float(env.scores[0])
+            score1 = float(env.scores[1])
+            score_diffs.append(score0 - score1)
+            min_score = min(env.scores)
+            winners = [i for i, score in enumerate(env.scores) if score == min_score]
+            wins += 1.0 / float(len(winners)) if 0 in winners else 0.0
+            completed += 1
+
+        if completed > 0:
+            per_bot[bot_name] = {
+                "games": float(completed),
+                "mean_score_diff_p0_minus_p1": float(mean(score_diffs)),
+                "win_rate_p0": float(wins / completed),
+            }
+            all_score_diffs.extend(score_diffs)
+            all_wins += wins
+            all_games += completed
+        else:
+            per_bot[bot_name] = {
+                "games": 0.0,
+                "mean_score_diff_p0_minus_p1": float("nan"),
+                "win_rate_p0": float("nan"),
+            }
+
+    overall = {
+        "eval_bots_mean_score_diff_p0_minus_p1": float(mean(all_score_diffs) if all_score_diffs else float("nan")),
+        "eval_bots_win_rate_p0": float(all_wins / all_games) if all_games > 0 else float("nan"),
+    }
+    return overall, per_bot
 
 
 def main() -> None:
@@ -438,6 +492,7 @@ def main() -> None:
     parser.add_argument("--train-steps-per-iter", type=int, default=64)
     parser.add_argument("--eval-every", type=int, default=20)
     parser.add_argument("--eval-episodes", type=int, default=200)
+    parser.add_argument("--eval-bot-episodes-per-bot", type=int, default=20)
     parser.add_argument("--selfplay-sims", type=int, default=50)
     parser.add_argument("--selfplay-sims-mid", type=int, default=100)
     parser.add_argument("--selfplay-sims-final", type=int, default=200)
@@ -451,6 +506,14 @@ def main() -> None:
     parser.add_argument("--dirichlet-switch-iter", type=int, default=200)
     parser.add_argument("--opponent-pool-size", type=int, default=10)
     parser.add_argument("--opponent-latest-prob", type=float, default=0.7)
+    parser.add_argument("--opponent-checkpoint-fraction", type=float, default=0.2)
+    parser.add_argument("--heuristic-bot-fraction", type=float, default=0.3)
+    parser.add_argument(
+        "--heuristic-bot-names",
+        type=str,
+        default="greedy_value_replacement,information_first_flip,column_hunter,risk_aware_unknown_replacement,end_round_aggro,anti_discard",
+    )
+    parser.add_argument("--heuristic-bot-epsilon", type=float, default=0.02)
     parser.add_argument("--opponent-snapshot-every", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--unroll-steps", type=int, default=5)
@@ -459,13 +522,13 @@ def main() -> None:
     parser.add_argument(
         "--time-penalty-per-step",
         type=float,
-        default=0.0002,
-        help="Subtract this amount from the acting player's reward every step to encourage shorter games.",
+        default=0.0,
+        help="Subtract this amount from the acting player's reward every step.",
     )
     parser.add_argument(
         "--time-penalty-max-per-episode",
         type=float,
-        default=0.05,
+        default=-1.0,
         help="Cap the cumulative time penalty applied over one episode. Use <0 to disable cap.",
     )
     parser.add_argument("--max-moves-per-episode", type=int, default=2000)
@@ -499,6 +562,8 @@ def main() -> None:
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
+    bot_names = _parse_bot_names(args.heuristic_bot_names)
+    heuristic_bots = [make_heuristic_bot(name, seed=args.seed + 20_000 + i, epsilon=args.heuristic_bot_epsilon) for i, name in enumerate(bot_names)]
 
     output_dir = Path(args.output_dir)
     graph_dir = output_dir / "graphs"
@@ -608,6 +673,8 @@ def main() -> None:
         )
         entropy_vals: list[float] = []
         root_vals: list[float] = []
+        bot_opponent_episodes = 0
+        checkpoint_opponent_episodes = 0
         selfplay_start = time.perf_counter()
 
         for ep_idx in range(args.selfplay_episodes_per_iter):
@@ -618,12 +685,19 @@ def main() -> None:
                 env_factory = lambda s=ep_seed: SkyjoEnv(num_players=2, seed=s, setup_mode="auto")
 
             selected_opponent: BeliefAwareMuZeroNet | None = None
-            if args.opponent_pool_size > 0 and opponent_pool:
-                use_latest = random.random() < max(0.0, min(1.0, args.opponent_latest_prob))
-                if not use_latest:
+            opponent_action_selector: Any = None
+            use_bot = bool(heuristic_bots) and (random.random() < max(0.0, min(1.0, args.heuristic_bot_fraction)))
+            if use_bot:
+                bot = random.choice(heuristic_bots)
+                opponent_action_selector = lambda o, legal, actor, b=bot: int(b.select_action(o, legal))
+                bot_opponent_episodes += 1
+            elif args.opponent_pool_size > 0 and opponent_pool:
+                use_checkpoint = random.random() < max(0.0, min(1.0, args.opponent_checkpoint_fraction))
+                if use_checkpoint:
                     snapshot = random.choice(opponent_pool)
                     opponent_model.load_state_dict(snapshot)
                     selected_opponent = opponent_model
+                    checkpoint_opponent_episodes += 1
 
             learner_player_id = random.randint(0, 1)
             episode = generate_belief_self_play_episode(
@@ -636,6 +710,7 @@ def main() -> None:
                 device=train_cfg.device,
                 time_penalty_per_step=train_cfg.time_penalty_per_step,
                 time_penalty_max_per_episode=train_cfg.time_penalty_max_per_episode,
+                opponent_action_selector=opponent_action_selector,
             )
             replay.add_episode(episode)
             elapsed = time.perf_counter() - selfplay_start
@@ -672,15 +747,22 @@ def main() -> None:
                 accum[key] /= effective_steps
 
         eval_metrics: dict[str, Any] = {
-            "eval_mean_return_p0": float("nan"),
+            "eval_mean_score_p0": float("nan"),
+            "eval_mean_score_p1": float("nan"),
+            "eval_mean_score_diff_p0_minus_p1": float("nan"),
+            "eval_score_diff_p25": float("nan"),
+            "eval_score_diff_p50": float("nan"),
+            "eval_score_diff_p75": float("nan"),
             "eval_win_rate_p0": float("nan"),
+            "eval_tie_rate": float("nan"),
             "eval_mean_episode_length": float("nan"),
             "eval_truncation_rate": float("nan"),
-            "eval_value_brier": float("nan"),
-            "eval_value_ece": float("nan"),
+            "eval_bots_mean_score_diff_p0_minus_p1": float("nan"),
+            "eval_bots_win_rate_p0": float("nan"),
+            "eval_value_mse": float("nan"),
+            "eval_value_mae": float("nan"),
             "eval_value_pred_mean": float("nan"),
-            "eval_value_outcome_mean": float("nan"),
-            "eval_calibration_bins": [],
+            "eval_value_target_mean": float("nan"),
         }
         if iteration % args.eval_every == 0:
             print(f"[eval belief] starting iteration {iteration:04d} with {args.eval_episodes} episodes")
@@ -693,11 +775,22 @@ def main() -> None:
                 seed_base=args.seed * 1000 + iteration * 100,
                 env_mode=args.env_mode,
             )
-            _save_calibration(
-                output_dir=output_dir,
-                iteration=iteration,
-                calibration_bins=list(eval_metrics["eval_calibration_bins"]),
+            bot_overall, bot_detail = evaluate_belief_vs_heuristic_bots(
+                model=model,
+                bot_names=bot_names,
+                episodes_per_bot=args.eval_bot_episodes_per_bot,
+                sims=args.eval_sims,
+                max_moves=args.eval_max_moves,
+                device=args.device,
+                seed_base=args.seed * 1_000_000 + iteration * 1_000,
+                env_mode=args.env_mode,
+                bot_epsilon=args.heuristic_bot_epsilon,
             )
+            eval_metrics.update(bot_overall)
+            bot_eval_dir = output_dir / "bot_eval"
+            _ensure_dir(bot_eval_dir)
+            with (bot_eval_dir / f"iter_{iteration:04d}.json").open("w", encoding="utf-8") as f:
+                json.dump({"iteration": iteration, "overall": bot_overall, "per_bot": bot_detail}, f, indent=2)
 
         history["iteration"].append(float(iteration))
         for key in ("loss_total", "loss_policy", "loss_value", "loss_reward", "loss_winner", "loss_rank", "grad_norm"):
@@ -708,16 +801,30 @@ def main() -> None:
         history["selfplay_num_simulations"].append(float(selfplay_sims))
         history["selfplay_root_dirichlet_alpha"].append(float(dirichlet_alpha))
         history["selfplay_root_exploration_fraction"].append(float(dirichlet_frac))
+        history["selfplay_vs_bot_fraction"].append(float(bot_opponent_episodes / max(1, args.selfplay_episodes_per_iter)))
+        history["selfplay_vs_checkpoint_fraction"].append(
+            float(checkpoint_opponent_episodes / max(1, args.selfplay_episodes_per_iter))
+        )
         history["winner_loss_weight"].append(float(winner_loss_weight))
         history["rank_loss_weight"].append(float(rank_loss_weight))
-        history["eval_mean_return_p0"].append(float(eval_metrics["eval_mean_return_p0"]))
+        history["eval_mean_score_p0"].append(float(eval_metrics["eval_mean_score_p0"]))
+        history["eval_mean_score_p1"].append(float(eval_metrics["eval_mean_score_p1"]))
+        history["eval_mean_score_diff_p0_minus_p1"].append(float(eval_metrics["eval_mean_score_diff_p0_minus_p1"]))
+        history["eval_score_diff_p25"].append(float(eval_metrics["eval_score_diff_p25"]))
+        history["eval_score_diff_p50"].append(float(eval_metrics["eval_score_diff_p50"]))
+        history["eval_score_diff_p75"].append(float(eval_metrics["eval_score_diff_p75"]))
         history["eval_win_rate_p0"].append(float(eval_metrics["eval_win_rate_p0"]))
+        history["eval_tie_rate"].append(float(eval_metrics["eval_tie_rate"]))
         history["eval_mean_episode_length"].append(float(eval_metrics["eval_mean_episode_length"]))
         history["eval_truncation_rate"].append(float(eval_metrics["eval_truncation_rate"]))
-        history["eval_value_brier"].append(float(eval_metrics["eval_value_brier"]))
-        history["eval_value_ece"].append(float(eval_metrics["eval_value_ece"]))
+        history["eval_bots_mean_score_diff_p0_minus_p1"].append(
+            float(eval_metrics["eval_bots_mean_score_diff_p0_minus_p1"])
+        )
+        history["eval_bots_win_rate_p0"].append(float(eval_metrics["eval_bots_win_rate_p0"]))
+        history["eval_value_mse"].append(float(eval_metrics["eval_value_mse"]))
+        history["eval_value_mae"].append(float(eval_metrics["eval_value_mae"]))
         history["eval_value_pred_mean"].append(float(eval_metrics["eval_value_pred_mean"]))
-        history["eval_value_outcome_mean"].append(float(eval_metrics["eval_value_outcome_mean"]))
+        history["eval_value_target_mean"].append(float(eval_metrics["eval_value_target_mean"]))
 
         _save_metrics(history, output_dir)
         _save_graphs(history, graph_dir)

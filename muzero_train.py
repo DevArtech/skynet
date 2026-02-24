@@ -29,8 +29,8 @@ class MuZeroTrainConfig:
     policy_loss_weight: float = 1.0
     value_loss_weight: float = 1.0
     reward_loss_weight: float = 1.0
-    time_penalty_per_step: float = 0.0002
-    time_penalty_max_per_episode: float | None = 0.05
+    time_penalty_per_step: float = 0.0
+    time_penalty_max_per_episode: float | None = None
     truncation_penalty: float = 1.0
     device: str = "cpu"
 
@@ -42,6 +42,8 @@ class StepRecord:
     reward: float
     policy_target: list[float]
     root_value: float
+    current_player_id: int
+    final_score_utility: float
 
 
 @dataclass
@@ -105,12 +107,7 @@ class ReplayBuffer:
 
                 step = episode.steps[idx]
                 target_policy[b, k] = torch.tensor(step.policy_target, dtype=torch.float32)
-                target_value[b, k] = self._compute_value_target(
-                    episode=episode,
-                    start_index=idx,
-                    td_steps=td_steps,
-                    discount=discount,
-                )
+                target_value[b, k] = float(step.final_score_utility)
                 policy_mask[b, k] = 1.0
                 value_mask[b, k] = 1.0
 
@@ -130,26 +127,6 @@ class ReplayBuffer:
             "reward_mask": reward_mask,
         }
 
-    @staticmethod
-    def _compute_value_target(
-        episode: EpisodeRecord,
-        start_index: int,
-        td_steps: int,
-        discount: float,
-    ) -> float:
-        value = 0.0
-        discount_acc = 1.0
-        end_index = min(start_index + td_steps, len(episode.steps))
-        for i in range(start_index, end_index):
-            value += discount_acc * episode.steps[i].reward
-            discount_acc *= discount
-
-        bootstrap_index = start_index + td_steps
-        if bootstrap_index < len(episode.steps):
-            value += discount_acc * episode.steps[bootstrap_index].root_value
-        return float(value)
-
-
 def _policy_dict_to_vector(policy_target: dict[int, float], action_space_size: int) -> list[float]:
     policy = [0.0] * action_space_size
     for action, prob in policy_target.items():
@@ -160,6 +137,13 @@ def _policy_dict_to_vector(policy_target: dict[int, float], action_space_size: i
         uniform = 1.0 / action_space_size
         return [uniform] * action_space_size
     return [p / total for p in policy]
+
+
+def _one_hot_policy(action: int, action_space_size: int) -> list[float]:
+    policy = [0.0] * action_space_size
+    if 0 <= int(action) < action_space_size:
+        policy[int(action)] = 1.0
+    return policy
 
 
 def generate_self_play_episode(
@@ -173,6 +157,7 @@ def generate_self_play_episode(
     time_penalty_per_step: float = 0.0,
     time_penalty_max_per_episode: float | None = None,
     truncation_penalty: float = 0.0,
+    opponent_action_selector: Callable[[dict[str, Any], list[int], int], int] | None = None,
 ) -> EpisodeRecord:
     if env_factory is None:
         env_factory = lambda: SkyjoEnv(num_players=2, seed=random.randint(0, 10_000_000), setup_mode="auto")
@@ -188,30 +173,51 @@ def generate_self_play_episode(
     while not terminated and move_count < max_moves:
         actor = env.current_player
         legal_actions = env.legal_actions()
-        acting_model = model
-        if opponent_model is not None and int(actor) != int(learner_player_id):
-            acting_model = opponent_model
-        stats = run_mcts(
-            model=acting_model,
-            observation=observation,
-            legal_action_ids=legal_actions,
-            config=mcts_config,
-            device=device,
-        )
-        next_observation, rewards, terminated, _ = env.step(stats.action)
+        is_opponent_turn = int(actor) != int(learner_player_id)
+        if is_opponent_turn and opponent_action_selector is not None:
+            chosen_action = int(opponent_action_selector(observation, legal_actions, int(actor)))
+            if chosen_action not in legal_actions:
+                chosen_action = int(legal_actions[0])
+            stats = run_mcts(
+                model=model,
+                observation=observation,
+                legal_action_ids=legal_actions,
+                config=mcts_config,
+                device=device,
+            )
+            policy_target = _one_hot_policy(chosen_action, action_space_size=action_space_size)
+            root_value = float(stats.root_value)
+        else:
+            acting_model = model
+            if opponent_model is not None and is_opponent_turn:
+                acting_model = opponent_model
+            stats = run_mcts(
+                model=acting_model,
+                observation=observation,
+                legal_action_ids=legal_actions,
+                config=mcts_config,
+                device=device,
+            )
+            chosen_action = int(stats.action)
+            policy_target = _policy_dict_to_vector(stats.policy_target, action_space_size=action_space_size)
+            root_value = float(stats.root_value)
+        next_observation, rewards, terminated, _ = env.step(chosen_action)
         penalty = float(time_penalty_per_step)
         if time_penalty_max_per_episode is not None and time_penalty_max_per_episode >= 0.0:
             penalty = min(penalty, max(0.0, float(time_penalty_max_per_episode) - penalty_accum))
         penalty_accum += penalty
-        reward = float(rewards.get(f"player_{actor}", 0.0)) - penalty
+        _ = rewards  # Environment rewards are ignored; value target is terminal score utility.
+        reward = -penalty
 
         steps.append(
             StepRecord(
                 observation=copy.deepcopy(observation),
-                action=int(stats.action),
+                action=chosen_action,
                 reward=reward,
-                policy_target=_policy_dict_to_vector(stats.policy_target, action_space_size=action_space_size),
-                root_value=float(stats.root_value),
+                policy_target=policy_target,
+                root_value=root_value,
+                current_player_id=int(actor),
+                final_score_utility=0.0,
             )
         )
 
@@ -221,6 +227,15 @@ def generate_self_play_episode(
     if not terminated and steps and truncation_penalty > 0.0:
         # Penalize capped episodes so the policy does not learn to stall forever.
         steps[-1].reward -= float(truncation_penalty)
+    elif terminated and steps:
+        scores = list(env.scores)
+        num_players = len(scores)
+        for step in steps:
+            actor = int(step.current_player_id)
+            own = float(scores[actor])
+            others = [float(scores[i]) for i in range(num_players) if i != actor]
+            opp_mean = float(sum(others) / max(1, len(others)))
+            step.final_score_utility = opp_mean - own
 
     return EpisodeRecord(steps=steps, terminated=terminated)
 

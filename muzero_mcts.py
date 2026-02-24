@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 from muzero_model import MuZeroNet, observation_batch_to_tensors
+from skyjo_decision_env import DecisionAction, DecisionPhase
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class SearchStats:
 @dataclass
 class Node:
     prior: float
+    decision_phase_id: int | None = None
     visit_count: int = 0
     value_sum: float = 0.0
     reward: float = 0.0
@@ -73,6 +75,37 @@ def _legal_model_actions(legal_action_ids: list[int], action_space_size: int) ->
     return [a for a in legal_action_ids if 0 <= a < action_space_size]
 
 
+def _infer_next_decision_phase(decision_phase_id: int | None, action: int) -> int | None:
+    if decision_phase_id is None:
+        return None
+    phase = int(decision_phase_id)
+    if phase == int(DecisionPhase.CHOOSE_SOURCE):
+        if action == int(DecisionAction.CHOOSE_DISCARD):
+            return int(DecisionPhase.CHOOSE_POSITION)
+        return int(DecisionPhase.KEEP_OR_DISCARD)
+    if phase == int(DecisionPhase.KEEP_OR_DISCARD):
+        return int(DecisionPhase.CHOOSE_POSITION)
+    if phase == int(DecisionPhase.CHOOSE_POSITION):
+        return int(DecisionPhase.CHOOSE_SOURCE)
+    return phase
+
+
+def _phase_legal_actions(decision_phase_id: int | None, action_space_size: int) -> list[int]:
+    if decision_phase_id is None:
+        return list(range(action_space_size))
+    phase = int(decision_phase_id)
+    if phase == int(DecisionPhase.SETUP_REVEAL):
+        return [a for a in range(int(DecisionAction.CHOOSE_POS_BASE), action_space_size)]
+    if phase == int(DecisionPhase.CHOOSE_SOURCE):
+        # In tree search we allow both; discard availability depends on latent deck/discard state.
+        return [int(DecisionAction.CHOOSE_DECK), int(DecisionAction.CHOOSE_DISCARD)]
+    if phase == int(DecisionPhase.KEEP_OR_DISCARD):
+        return [int(DecisionAction.KEEP_DRAWN), int(DecisionAction.DISCARD_DRAWN)]
+    if phase == int(DecisionPhase.CHOOSE_POSITION):
+        return [a for a in range(int(DecisionAction.CHOOSE_POS_BASE), action_space_size)]
+    return list(range(action_space_size))
+
+
 def _expand_root(
     root: Node,
     model: MuZeroNet,
@@ -95,8 +128,9 @@ def _expand_root(
     masked_logits[legal_mask <= 0] = -1e9
     priors = torch.softmax(masked_logits, dim=-1)
 
+    next_phase_by_action = {action: _infer_next_decision_phase(root.decision_phase_id, action) for action in legal_actions}
     for action in legal_actions:
-        root.children[action] = Node(prior=float(priors[action].item()))
+        root.children[action] = Node(prior=float(priors[action].item()), decision_phase_id=next_phase_by_action[action])
 
     return value
 
@@ -151,8 +185,10 @@ def _expand_with_model(parent: Node, node: Node, action: int, model: MuZeroNet) 
 
     node.hidden_state = next_state
     node.reward = reward
-    for a in range(_model_action_space_size(model)):
-        node.children[a] = Node(prior=float(priors[a].item()))
+    node.decision_phase_id = _infer_next_decision_phase(parent.decision_phase_id, action)
+    legal_actions = _phase_legal_actions(node.decision_phase_id, _model_action_space_size(model))
+    for a in legal_actions:
+        node.children[a] = Node(prior=float(priors[a].item()), decision_phase_id=_infer_next_decision_phase(node.decision_phase_id, a))
     return value
 
 
@@ -232,6 +268,9 @@ def run_mcts(
         )
 
     root = Node(prior=1.0)
+    phase_id = observation.get("decision_phase_id")
+    if isinstance(phase_id, int):
+        root.decision_phase_id = phase_id
     root_value = _expand_root(root, model, observation, legal_actions, dev)
     _add_root_dirichlet_noise(root, legal_actions, cfg)
 

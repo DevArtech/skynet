@@ -31,8 +31,8 @@ class BeliefTrainConfig:
     reward_loss_weight: float = 1.0
     winner_loss_weight: float = 0.1
     rank_loss_weight: float = 0.1
-    time_penalty_per_step: float = 0.0002
-    time_penalty_max_per_episode: float | None = 0.05
+    time_penalty_per_step: float = 0.0
+    time_penalty_max_per_episode: float | None = None
     device: str = "cpu"
 
 
@@ -47,6 +47,7 @@ class BeliefStepRecord:
     num_players: int
     winner_id: int
     final_ranks: list[int]
+    final_score_utility: float
 
 
 @dataclass
@@ -64,6 +65,13 @@ def _policy_dict_to_vector(policy_target: dict[int, float], action_space_size: i
     if s <= 0.0:
         return [1.0 / action_space_size] * action_space_size
     return [v / s for v in vec]
+
+
+def _one_hot_policy(action: int, action_space_size: int) -> list[float]:
+    vec = [0.0] * action_space_size
+    if 0 <= int(action) < action_space_size:
+        vec[int(action)] = 1.0
+    return vec
 
 
 def _compute_ranks(scores: list[int]) -> list[int]:
@@ -130,7 +138,7 @@ class BeliefReplayBuffer:
                 rk = int(step.final_ranks[cp] if cp < len(step.final_ranks) else max_players)
 
                 target_policy[b, k] = torch.tensor(step.policy_target, dtype=torch.float32)
-                target_value[b, k] = 1.0 if cp == wr else 0.0
+                target_value[b, k] = float(step.final_score_utility)
                 winner_id[b, k] = max(0, min(max_players - 1, wr))
                 ego_rank[b, k] = max(1, min(max_players, rk))
                 current_player[b, k] = max(0, min(max_players - 1, cp))
@@ -169,6 +177,7 @@ def generate_belief_self_play_episode(
     device: str = "cpu",
     time_penalty_per_step: float = 0.0,
     time_penalty_max_per_episode: float | None = None,
+    opponent_action_selector: Callable[[dict[str, Any], list[int], int], int] | None = None,
 ) -> BeliefEpisodeRecord:
     if env_factory is None:
         env_factory = lambda: SkyjoEnv(num_players=2, seed=random.randint(0, 10_000_000), setup_mode="auto")
@@ -184,18 +193,37 @@ def generate_belief_self_play_episode(
     while not terminated and moves < max_moves:
         actor = int(env.current_player)
         legal = env.legal_actions()
-        acting_model = model
-        if opponent_model is not None and actor != int(learner_player_id):
-            acting_model = opponent_model
-        stats = run_belief_mcts(
-            model=acting_model,
-            observation=obs,
-            legal_action_ids=legal,
-            ego_player_id=actor,
-            config=mcts_config,
-            device=device,
-        )
-        next_obs, rewards, terminated, _ = env.step(stats.action)
+        is_opponent_turn = actor != int(learner_player_id)
+        if is_opponent_turn and opponent_action_selector is not None:
+            chosen_action = int(opponent_action_selector(obs, legal, actor))
+            if chosen_action not in legal:
+                chosen_action = int(legal[0])
+            stats = run_belief_mcts(
+                model=model,
+                observation=obs,
+                legal_action_ids=legal,
+                ego_player_id=actor,
+                config=mcts_config,
+                device=device,
+            )
+            policy_target = _one_hot_policy(chosen_action, action_space_size)
+            root_value = float(stats.root_value)
+        else:
+            acting_model = model
+            if opponent_model is not None and is_opponent_turn:
+                acting_model = opponent_model
+            stats = run_belief_mcts(
+                model=acting_model,
+                observation=obs,
+                legal_action_ids=legal,
+                ego_player_id=actor,
+                config=mcts_config,
+                device=device,
+            )
+            chosen_action = int(stats.action)
+            policy_target = _policy_dict_to_vector(stats.policy_target, action_space_size)
+            root_value = float(stats.root_value)
+        next_obs, rewards, terminated, _ = env.step(chosen_action)
         penalty = float(time_penalty_per_step)
         if time_penalty_max_per_episode is not None and time_penalty_max_per_episode >= 0.0:
             penalty = min(penalty, max(0.0, float(time_penalty_max_per_episode) - penalty_accum))
@@ -203,10 +231,10 @@ def generate_belief_self_play_episode(
         pending_steps.append(
             {
                 "observation": copy.deepcopy(obs),
-                "action": int(stats.action),
-                "reward": float(rewards.get(f"player_{actor}", 0.0)) - penalty,
-                "policy_target": _policy_dict_to_vector(stats.policy_target, action_space_size),
-                "root_value": float(stats.root_value),
+                "action": chosen_action,
+                "reward": -penalty,
+                "policy_target": policy_target,
+                "root_value": root_value,
                 "current_player_id": actor,
                 "num_players": env.num_players,
             }
@@ -222,6 +250,10 @@ def generate_belief_self_play_episode(
 
     steps: list[BeliefStepRecord] = []
     for s in pending_steps:
+        cp = int(s["current_player_id"])
+        own = float(scores[cp]) if cp < len(scores) else 0.0
+        others = [float(scores[i]) for i in range(len(scores)) if i != cp]
+        opp_mean = float(sum(others) / max(1, len(others)))
         steps.append(
             BeliefStepRecord(
                 observation=s["observation"],
@@ -229,10 +261,11 @@ def generate_belief_self_play_episode(
                 reward=s["reward"],
                 policy_target=s["policy_target"],
                 root_value=s["root_value"],
-                current_player_id=s["current_player_id"],
+                current_player_id=cp,
                 num_players=s["num_players"],
                 winner_id=winner_id,
                 final_ranks=final_ranks,
+                final_score_utility=opp_mean - own,
             )
         )
     return BeliefEpisodeRecord(steps=steps, terminated=terminated)
