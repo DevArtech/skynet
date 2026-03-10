@@ -24,7 +24,7 @@ from muzero_train import (
     train_step,
 )
 from heuristic_bots import BOT_REGISTRY, make_heuristic_bot
-from skyjo_decision_env import DECISION_ACTION_SPACE, SkyjoDecisionEnv
+from skyjo_decision_env import DECISION_ACTION_SPACE, DecisionAction, SkyjoDecisionEnv
 from skyjo_env import SkyjoEnv
 
 matplotlib.use("Agg")
@@ -93,6 +93,8 @@ def _build_history_template() -> dict[str, list[float]]:
         "loss_policy": [],
         "loss_value": [],
         "loss_reward": [],
+        "loss_winner": [],
+        "loss_rank": [],
         "grad_norm": [],
         "replay_steps": [],
         "selfplay_mean_steps": [],
@@ -110,6 +112,12 @@ def _build_history_template() -> dict[str, list[float]]:
         "selfplay_root_exploration_fraction": [],
         "selfplay_vs_bot_fraction": [],
         "selfplay_vs_checkpoint_fraction": [],
+        "selfplay_curriculum_stage": [],
+        "selfplay_curriculum_bot_fraction_target": [],
+        "selfplay_curriculum_anchor_met": [],
+        "selfplay_curriculum_all_met": [],
+        "winner_loss_weight": [],
+        "rank_loss_weight": [],
         "eval_mean_score_p0": [],
         "eval_mean_score_p1": [],
         "eval_mean_score_diff_p0_minus_p1": [],
@@ -121,8 +129,18 @@ def _build_history_template() -> dict[str, list[float]]:
         "eval_nontrunc_tie_rate": [],
         "eval_mean_episode_length": [],
         "eval_truncation_rate": [],
+        "eval_take_discard_when_discard_le_0_rate": [],
+        "eval_take_discard_when_discard_le_2_rate": [],
+        "eval_keep_when_drawn_le_0_rate": [],
+        "eval_keep_when_drawn_le_2_rate": [],
+        "eval_replace_known_higher_when_keep_low_rate": [],
+        "eval_harmful_known_replace_rate": [],
         "eval_bots_mean_score_diff_p0_minus_p1": [],
         "eval_bots_win_rate_p0": [],
+        "eval_value_mse": [],
+        "eval_value_mae": [],
+        "eval_value_pred_mean": [],
+        "eval_value_target_mean": [],
     }
 
 
@@ -146,6 +164,21 @@ def _percentile(values: list[float], q: float) -> float:
         return ordered[lo]
     weight = pos - lo
     return float((1.0 - weight) * ordered[lo] + weight * ordered[hi])
+
+
+def _current_player_view(obs: dict[str, Any]) -> tuple[list[int], list[int]]:
+    board_views = obs.get("board_views", {})
+    if not isinstance(board_views, dict):
+        return [], []
+    current_player = int(obs.get("current_player", 0))
+    view = board_views.get(current_player)
+    if view is None:
+        view = board_views.get(str(current_player))
+    if not isinstance(view, dict):
+        return [], []
+    values = [int(v) for v in view.get("values", [])]
+    visible = [int(v) for v in view.get("visible_mask", [])]
+    return values, visible
 
 
 def _observer_card_visible(obs: dict[str, Any], pos: int) -> bool | None:
@@ -287,6 +320,21 @@ def evaluate_model(
     truncations = 0
     tie_episodes = 0
     nontrunc_tie_episodes = 0
+    take_discard_le0_num = 0
+    take_discard_le0_den = 0
+    take_discard_le2_num = 0
+    take_discard_le2_den = 0
+    keep_drawn_le0_num = 0
+    keep_drawn_le0_den = 0
+    keep_drawn_le2_num = 0
+    keep_drawn_le2_den = 0
+    replace_known_higher_when_keep_low_num = 0
+    replace_known_higher_when_keep_low_den = 0
+    harmful_known_replace_num = 0
+    harmful_known_replace_den = 0
+    bad_take_discard_examples: list[str] = []
+    bad_keep_drawn_examples: list[str] = []
+    harmful_replace_examples: list[str] = []
     eval_start = time.perf_counter()
     progress_every = max(1, num_episodes // 4)
 
@@ -299,6 +347,9 @@ def evaluate_model(
         obs = env.reset()
         terminated = False
         step_count = 0
+        pending_source: str | None = None
+        pending_drawn_value: int | None = None
+        pending_keep_drawn: bool | None = None
         while not terminated and (max_moves <= 0 or step_count < max_moves):
             legal_actions = env.legal_actions()
             stats = run_mcts(
@@ -308,7 +359,83 @@ def evaluate_model(
                 config=eval_cfg,
                 device=device,
             )
-            obs, _, terminated, _ = env.step(stats.action)
+            action = int(stats.action)
+            if env_mode == "decision":
+                phase = str(obs.get("decision_phase", ""))
+                if phase == "CHOOSE_SOURCE":
+                    discard_top = int(obs.get("discard_top", 99))
+                    if discard_top <= 0:
+                        take_discard_le0_den += 1
+                        if action == int(DecisionAction.CHOOSE_DISCARD):
+                            take_discard_le0_num += 1
+                        elif len(bad_take_discard_examples) < 3:
+                            bad_take_discard_examples.append(
+                                f"ep={ep_idx + 1} step={step_count + 1} discard_top={discard_top} action={action}"
+                            )
+                    if discard_top <= 2:
+                        take_discard_le2_den += 1
+                        if action == int(DecisionAction.CHOOSE_DISCARD):
+                            take_discard_le2_num += 1
+                    if action == int(DecisionAction.CHOOSE_DISCARD):
+                        pending_source = "DISCARD"
+                        pending_drawn_value = discard_top
+                        pending_keep_drawn = True
+                    else:
+                        pending_source = "DECK"
+                        pending_drawn_value = None
+                        pending_keep_drawn = None
+                elif phase == "KEEP_OR_DISCARD":
+                    drawn_value = int(obs.get("current_drawn_value", 99))
+                    if drawn_value <= 0:
+                        keep_drawn_le0_den += 1
+                        if action == int(DecisionAction.KEEP_DRAWN):
+                            keep_drawn_le0_num += 1
+                        elif len(bad_keep_drawn_examples) < 3:
+                            bad_keep_drawn_examples.append(
+                                f"ep={ep_idx + 1} step={step_count + 1} drawn={drawn_value} action={action}"
+                            )
+                    if drawn_value <= 2:
+                        keep_drawn_le2_den += 1
+                        if action == int(DecisionAction.KEEP_DRAWN):
+                            keep_drawn_le2_num += 1
+                    pending_keep_drawn = action == int(DecisionAction.KEEP_DRAWN)
+                    pending_drawn_value = drawn_value
+                elif phase == "CHOOSE_POSITION":
+                    if action >= int(DecisionAction.CHOOSE_POS_BASE):
+                        pos = action - int(DecisionAction.CHOOSE_POS_BASE)
+                        values, visible = _current_player_view(obs)
+                        if 0 <= pos < len(values) and pos < len(visible) and visible[pos] == 1 and values[pos] != -99:
+                            old_value = int(values[pos])
+                            if pending_drawn_value is not None:
+                                harmful_known_replace_den += 1
+                                if int(pending_drawn_value) > old_value:
+                                    harmful_known_replace_num += 1
+                                    if len(harmful_replace_examples) < 3:
+                                        harmful_replace_examples.append(
+                                            " ".join(
+                                                [
+                                                    f"ep={ep_idx + 1}",
+                                                    f"step={step_count + 1}",
+                                                    f"pos={pos}",
+                                                    f"known_old={old_value}",
+                                                    f"new={int(pending_drawn_value)}",
+                                                    f"source={pending_source or 'unknown'}",
+                                                ]
+                                            )
+                                        )
+                            if (
+                                pending_source == "DECK"
+                                and bool(pending_keep_drawn)
+                                and pending_drawn_value is not None
+                                and int(pending_drawn_value) <= 2
+                            ):
+                                replace_known_higher_when_keep_low_den += 1
+                                if old_value > int(pending_drawn_value):
+                                    replace_known_higher_when_keep_low_num += 1
+                    pending_source = None
+                    pending_drawn_value = None
+                    pending_keep_drawn = None
+            obs, _, terminated, _ = env.step(action)
             step_count += 1
 
         if not terminated:
@@ -339,7 +466,7 @@ def evaluate_model(
                 f"mean_len={mean(lengths):.1f}"
             )
 
-    return {
+    metrics: dict[str, Any] = {
         "eval_mean_score_p0": float(mean(completed_scores_p0) if completed_scores_p0 else float("nan")),
         "eval_mean_score_p1": float(mean(completed_scores_p1) if completed_scores_p1 else float("nan")),
         "eval_mean_score_diff_p0_minus_p1": float(mean(completed_score_diffs) if completed_score_diffs else float("nan")),
@@ -351,7 +478,19 @@ def evaluate_model(
         "eval_nontrunc_tie_rate": float(nontrunc_tie_episodes / max(1, num_episodes - truncations)),
         "eval_mean_episode_length": float(mean(lengths) if lengths else 0.0),
         "eval_truncation_rate": float(truncations / max(1, num_episodes)),
+        "eval_take_discard_when_discard_le_0_rate": _safe_rate(float(take_discard_le0_num), float(take_discard_le0_den)),
+        "eval_take_discard_when_discard_le_2_rate": _safe_rate(float(take_discard_le2_num), float(take_discard_le2_den)),
+        "eval_keep_when_drawn_le_0_rate": _safe_rate(float(keep_drawn_le0_num), float(keep_drawn_le0_den)),
+        "eval_keep_when_drawn_le_2_rate": _safe_rate(float(keep_drawn_le2_num), float(keep_drawn_le2_den)),
+        "eval_replace_known_higher_when_keep_low_rate": _safe_rate(
+            float(replace_known_higher_when_keep_low_num), float(replace_known_higher_when_keep_low_den)
+        ),
+        "eval_harmful_known_replace_rate": _safe_rate(float(harmful_known_replace_num), float(harmful_known_replace_den)),
     }
+    metrics["_debug_bad_take_discard_examples"] = bad_take_discard_examples
+    metrics["_debug_bad_keep_drawn_examples"] = bad_keep_drawn_examples
+    metrics["_debug_harmful_replace_examples"] = harmful_replace_examples
+    return metrics
 
 
 def _parse_bot_names(raw: str) -> list[str]:
@@ -362,6 +501,35 @@ def _parse_bot_names(raw: str) -> list[str]:
     if invalid:
         raise ValueError(f"Unknown heuristic bot names: {invalid}. Available: {sorted(BOT_REGISTRY)}")
     return names
+
+
+def _bot_win_rate(per_bot: dict[str, dict[str, float]] | None, bot_name: str) -> float:
+    if not per_bot:
+        return float("nan")
+    stats = per_bot.get(bot_name)
+    if not isinstance(stats, dict):
+        return float("nan")
+    value = stats.get("win_rate_p0")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _sample_weighted(items: list[str], weights: list[float]) -> str:
+    if not items:
+        raise ValueError("Cannot sample from empty item list.")
+    nonneg = [max(0.0, float(w)) for w in weights]
+    total = sum(nonneg)
+    if total <= 0.0:
+        return random.choice(items)
+    pick = random.random() * total
+    acc = 0.0
+    for item, weight in zip(items, nonneg, strict=False):
+        acc += weight
+        if pick <= acc:
+            return item
+    return items[-1]
 
 
 def evaluate_model_vs_heuristic_bots(
@@ -490,6 +658,25 @@ def _save_graphs(history: dict[str, list[float]], graph_dir: Path) -> None:
         ("selfplay_terminated_fraction", "Self-Play Termination Fraction", "Fraction", "training_terminated_fraction.png"),
         ("selfplay_policy_entropy", "Self-Play Policy Entropy", "Entropy", "diagnostics_policy_entropy.png"),
         ("selfplay_root_value", "Self-Play Root Value", "Scalar", "diagnostics_root_value.png"),
+        (
+            "selfplay_vs_bot_fraction",
+            "Self-Play vs Heuristic Bot Fraction",
+            "Fraction",
+            "diagnostics_selfplay_vs_bot_fraction.png",
+        ),
+        (
+            "selfplay_vs_checkpoint_fraction",
+            "Self-Play vs Checkpoint Opponent Fraction",
+            "Fraction",
+            "diagnostics_selfplay_vs_checkpoint_fraction.png",
+        ),
+        (
+            "selfplay_curriculum_bot_fraction_target",
+            "Curriculum Target: Heuristic Opponent Fraction",
+            "Fraction",
+            "diagnostics_curriculum_bot_fraction_target.png",
+        ),
+        ("selfplay_curriculum_stage", "Curriculum Stage", "Stage", "diagnostics_curriculum_stage.png"),
         ("eval_mean_score_p0", "Eval Mean Final Score (Player 0)", "Score", "testing_eval_mean_score_p0.png"),
         ("eval_mean_score_p1", "Eval Mean Final Score (Player 1)", "Score", "testing_eval_mean_score_p1.png"),
         (
@@ -506,6 +693,42 @@ def _save_graphs(history: dict[str, list[float]], graph_dir: Path) -> None:
         ("eval_nontrunc_tie_rate", "Eval Tie Rate (Non-Truncated)", "Rate", "testing_eval_nontrunc_tie_rate.png"),
         ("eval_mean_episode_length", "Eval Episode Length", "Steps", "testing_eval_episode_length.png"),
         ("eval_truncation_rate", "Eval Truncation Rate", "Rate", "testing_eval_truncation_rate.png"),
+        (
+            "eval_take_discard_when_discard_le_0_rate",
+            "Eval: Take Discard Rate when Discard <= 0",
+            "Rate",
+            "testing_eval_take_discard_when_discard_le_0_rate.png",
+        ),
+        (
+            "eval_take_discard_when_discard_le_2_rate",
+            "Eval: Take Discard Rate when Discard <= 2",
+            "Rate",
+            "testing_eval_take_discard_when_discard_le_2_rate.png",
+        ),
+        (
+            "eval_keep_when_drawn_le_0_rate",
+            "Eval: Keep Drawn Rate when Drawn <= 0",
+            "Rate",
+            "testing_eval_keep_when_drawn_le_0_rate.png",
+        ),
+        (
+            "eval_keep_when_drawn_le_2_rate",
+            "Eval: Keep Drawn Rate when Drawn <= 2",
+            "Rate",
+            "testing_eval_keep_when_drawn_le_2_rate.png",
+        ),
+        (
+            "eval_replace_known_higher_when_keep_low_rate",
+            "Eval: Replace Known Higher when Keeping Low Card",
+            "Rate",
+            "testing_eval_replace_known_higher_when_keep_low_rate.png",
+        ),
+        (
+            "eval_harmful_known_replace_rate",
+            "Eval: Harmful Known Replace Rate",
+            "Rate",
+            "testing_eval_harmful_known_replace_rate.png",
+        ),
         (
             "eval_bots_mean_score_diff_p0_minus_p1",
             "Eval vs Heuristic Bots: Mean Score Diff (P0 - P1)",
@@ -541,16 +764,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train baseline MuZero on Skyjo and save diagnostics plots.")
     parser.add_argument("--iterations", type=int, default=2000)
     parser.add_argument("--selfplay-episodes-per-iter", type=int, default=32)
-    parser.add_argument("--train-steps-per-iter", type=int, default=64)
+    parser.add_argument("--train-steps-per-iter", type=int, default=96)
     parser.add_argument("--eval-every", type=int, default=20)
     parser.add_argument("--eval-episodes", type=int, default=200)
     parser.add_argument("--eval-bot-episodes-per-bot", type=int, default=20)
-    parser.add_argument("--selfplay-sims", type=int, default=50)
-    parser.add_argument("--selfplay-sims-mid", type=int, default=100)
-    parser.add_argument("--selfplay-sims-final", type=int, default=200)
-    parser.add_argument("--selfplay-sims-mid-iter", type=int, default=200)
-    parser.add_argument("--selfplay-sims-final-iter", type=int, default=500)
-    parser.add_argument("--eval-sims", type=int, default=100)
+    parser.add_argument("--selfplay-sims", type=int, default=200)
+    parser.add_argument("--selfplay-sims-mid", type=int, default=400)
+    parser.add_argument("--selfplay-sims-final", type=int, default=600)
+    parser.add_argument("--selfplay-sims-mid-iter", type=int, default=300)
+    parser.add_argument("--selfplay-sims-final-iter", type=int, default=900)
+    parser.add_argument("--eval-sims", type=int, default=800)
     parser.add_argument("--dirichlet-alpha-initial", type=float, default=0.3)
     parser.add_argument("--dirichlet-frac-initial", type=float, default=0.25)
     parser.add_argument("--dirichlet-alpha-late", type=float, default=0.15)
@@ -559,17 +782,62 @@ def main() -> None:
     parser.add_argument("--opponent-pool-size", type=int, default=10)
     parser.add_argument("--opponent-latest-prob", type=float, default=0.7)
     parser.add_argument("--opponent-checkpoint-fraction", type=float, default=0.2)
-    parser.add_argument("--heuristic-bot-fraction", type=float, default=0.3)
+    parser.add_argument("--heuristic-bot-fraction", type=float, default=0.6)
     parser.add_argument(
         "--heuristic-bot-names",
         type=str,
         default="greedy_value_replacement,information_first_flip,column_hunter,risk_aware_unknown_replacement,end_round_aggro,anti_discard",
     )
     parser.add_argument("--heuristic-bot-epsilon", type=float, default=0.02)
+    parser.add_argument(
+        "--curriculum-anchor-bots",
+        type=str,
+        default="greedy_value_replacement,risk_aware_unknown_replacement",
+        help="Comma-separated anchor bots to focus first.",
+    )
+    parser.add_argument(
+        "--curriculum-anchor-winrate-threshold",
+        type=float,
+        default=0.25,
+        help="Advance curriculum after anchor bots reach this win rate.",
+    )
+    parser.add_argument(
+        "--curriculum-all-bots-winrate-threshold",
+        type=float,
+        default=0.40,
+        help="Advance curriculum after all bots reach this win rate.",
+    )
+    parser.add_argument(
+        "--curriculum-anchor-weight",
+        type=float,
+        default=4.0,
+        help="Relative sampling weight for anchor bots before anchors are beaten.",
+    )
+    parser.add_argument(
+        "--curriculum-bot-fraction-after-anchor",
+        type=float,
+        default=0.20,
+        help="Target heuristic-opponent fraction after anchor bots are beaten.",
+    )
+    parser.add_argument(
+        "--curriculum-bot-fraction-after-all",
+        type=float,
+        default=0.15,
+        help="Target heuristic-opponent fraction after all bots are beaten.",
+    )
+    parser.add_argument(
+        "--curriculum-fraction-ramp-iters",
+        type=int,
+        default=120,
+        help="Iterations for each curriculum fraction ramp stage.",
+    )
     parser.add_argument("--opponent-snapshot-every", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--unroll-steps", type=int, default=5)
-    parser.add_argument("--td-steps", type=int, default=5)
+    parser.add_argument("--unroll-steps", type=int, default=8)
+    parser.add_argument("--td-steps", type=int, default=10,
+                        help="N-step bootstrap horizon for value targets.")
+    parser.add_argument("--phase-stratify-prob", type=float, default=0.3,
+                        help="Fraction of replay samples drawn from CHOOSE_SOURCE/KEEP_OR_DISCARD starts.")
     parser.add_argument(
         "--discount",
         type=float,
@@ -578,6 +846,9 @@ def main() -> None:
     )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--policy-loss-weight", type=float, default=1.0)
+    parser.add_argument("--value-loss-weight", type=float, default=1.5)
+    parser.add_argument("--reward-loss-weight", type=float, default=1.0)
     parser.add_argument(
         "--time-penalty-per-step",
         type=float,
@@ -603,7 +874,7 @@ def main() -> None:
         default=2000,
         help="Max moves during evaluation only. Use <=0 for no cap.",
     )
-    parser.add_argument("--replay-capacity-episodes", type=int, default=5000)
+    parser.add_argument("--replay-capacity-episodes", type=int, default=8000)
     parser.add_argument("--checkpoint-every", type=int, default=1)
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output dir.")
     parser.add_argument("--resume-checkpoint", type=str, default="", help="Resume from an explicit checkpoint file path.")
@@ -622,7 +893,10 @@ def main() -> None:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     bot_names = _parse_bot_names(args.heuristic_bot_names)
-    heuristic_bots = [make_heuristic_bot(name, seed=args.seed + 10_000 + i, epsilon=args.heuristic_bot_epsilon) for i, name in enumerate(bot_names)]
+    anchor_bot_names = [name for name in _parse_bot_names(args.curriculum_anchor_bots) if name in set(bot_names)]
+    anchor_met_iteration: int | None = None
+    all_met_iteration: int | None = None
+    latest_bot_detail: dict[str, dict[str, float]] | None = None
 
     output_dir = Path(args.output_dir)
     graph_dir = output_dir / "graphs"
@@ -641,6 +915,9 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        policy_loss_weight=args.policy_loss_weight,
+        value_loss_weight=args.value_loss_weight,
+        reward_loss_weight=args.reward_loss_weight,
         time_penalty_per_step=args.time_penalty_per_step,
         time_penalty_max_per_episode=(
             None if args.time_penalty_max_per_episode < 0.0 else args.time_penalty_max_per_episode
@@ -648,6 +925,7 @@ def main() -> None:
         truncation_penalty=args.truncation_penalty,
         max_moves_per_episode=args.max_moves_per_episode,
         replay_capacity_episodes=args.replay_capacity_episodes,
+        phase_stratify_prob=args.phase_stratify_prob,
         device=args.device,
     )
     optimizer = create_optimizer(model, train_cfg)
@@ -718,6 +996,34 @@ def main() -> None:
         bot_opponent_episodes = 0
         checkpoint_opponent_episodes = 0
         selfplay_start = time.perf_counter()
+        anchor_rates = [_bot_win_rate(latest_bot_detail, name) for name in anchor_bot_names]
+        anchor_met = bool(anchor_rates) and all(math.isfinite(v) and v >= args.curriculum_anchor_winrate_threshold for v in anchor_rates)
+        all_rates = [_bot_win_rate(latest_bot_detail, name) for name in bot_names]
+        all_met = bool(all_rates) and all(math.isfinite(v) and v >= args.curriculum_all_bots_winrate_threshold for v in all_rates)
+        if anchor_met and anchor_met_iteration is None:
+            anchor_met_iteration = iteration
+        if all_met and all_met_iteration is None:
+            all_met_iteration = iteration
+        stage = 0
+        effective_bot_fraction = max(0.0, min(1.0, float(args.heuristic_bot_fraction)))
+        if anchor_met_iteration is not None:
+            stage = 1
+            span = max(1, int(args.curriculum_fraction_ramp_iters))
+            p = max(0.0, min(1.0, float(iteration - anchor_met_iteration) / float(span)))
+            target_anchor = max(0.0, min(1.0, float(args.curriculum_bot_fraction_after_anchor)))
+            effective_bot_fraction = (1.0 - p) * effective_bot_fraction + p * target_anchor
+        if all_met_iteration is not None:
+            stage = 2
+            span = max(1, int(args.curriculum_fraction_ramp_iters))
+            p = max(0.0, min(1.0, float(iteration - all_met_iteration) / float(span)))
+            target_all = max(0.0, min(1.0, float(args.curriculum_bot_fraction_after_all)))
+            effective_bot_fraction = (1.0 - p) * effective_bot_fraction + p * target_all
+        bot_weights = [1.0 for _ in bot_names]
+        if stage == 0 and bot_names:
+            anchor_set = set(anchor_bot_names)
+            bot_weights = [
+                float(args.curriculum_anchor_weight) if name in anchor_set else 1.0 for name in bot_names
+            ]
 
         for ep_idx in range(args.selfplay_episodes_per_iter):
             env_seed = random.randint(0, 10_000_000)
@@ -728,9 +1034,11 @@ def main() -> None:
 
             selected_opponent: MuZeroNet | None = None
             opponent_action_selector: Any = None
-            use_bot = bool(heuristic_bots) and (random.random() < max(0.0, min(1.0, args.heuristic_bot_fraction)))
+            use_bot = bool(bot_names) and (random.random() < effective_bot_fraction)
             if use_bot:
-                bot = random.choice(heuristic_bots)
+                chosen_bot_name = _sample_weighted(bot_names, bot_weights)
+                bot_seed = int(args.seed + iteration * 1_000_000 + ep_idx)
+                bot = make_heuristic_bot(chosen_bot_name, seed=bot_seed, epsilon=args.heuristic_bot_epsilon)
                 opponent_action_selector = lambda o, legal, actor, b=bot: int(b.select_action(o, legal))
                 bot_opponent_episodes += 1
             elif args.opponent_pool_size > 0 and opponent_pool:
@@ -799,6 +1107,16 @@ def main() -> None:
             "eval_truncation_rate": float("nan"),
             "eval_bots_mean_score_diff_p0_minus_p1": float("nan"),
             "eval_bots_win_rate_p0": float("nan"),
+            "eval_take_discard_when_discard_le_0_rate": float("nan"),
+            "eval_take_discard_when_discard_le_2_rate": float("nan"),
+            "eval_keep_when_drawn_le_0_rate": float("nan"),
+            "eval_keep_when_drawn_le_2_rate": float("nan"),
+            "eval_replace_known_higher_when_keep_low_rate": float("nan"),
+            "eval_harmful_known_replace_rate": float("nan"),
+            "eval_value_mse": float("nan"),
+            "eval_value_mae": float("nan"),
+            "eval_value_pred_mean": float("nan"),
+            "eval_value_target_mean": float("nan"),
         }
         if iteration % args.eval_every == 0:
             print(f"[eval baseline] starting iteration {iteration:04d} with {args.eval_episodes} episodes")
@@ -825,6 +1143,35 @@ def main() -> None:
                 bot_epsilon=args.heuristic_bot_epsilon,
             )
             eval_metrics.update(bot_overall)
+            latest_bot_detail = bot_detail
+            # Print per-bot breakdown each eval so weak skills are obvious.
+            for bot_name in bot_names:
+                bot_stats = bot_detail.get(bot_name, {})
+                print(
+                    f"[eval baseline][bot {bot_name}] "
+                    f"games={bot_stats.get('games', float('nan'))} "
+                    f"win_rate_p0={bot_stats.get('win_rate_p0', float('nan')):.3f} "
+                    f"mean_score_diff={bot_stats.get('mean_score_diff_p0_minus_p1', float('nan')):.2f}"
+                )
+            keep_le0 = float(eval_metrics["eval_keep_when_drawn_le_0_rate"])
+            take_le0 = float(eval_metrics["eval_take_discard_when_discard_le_0_rate"])
+            harmful = float(eval_metrics["eval_harmful_known_replace_rate"])
+            if iteration >= 100:
+                if math.isfinite(keep_le0) and keep_le0 < 0.8:
+                    print(
+                        f"[warn baseline] low keep_when_drawn_le_0_rate={keep_le0:.3f} "
+                        f"(target >= 0.80); examples={eval_metrics.get('_debug_bad_keep_drawn_examples', [])}"
+                    )
+                if math.isfinite(take_le0) and take_le0 < 0.8:
+                    print(
+                        f"[warn baseline] low take_discard_when_discard_le_0_rate={take_le0:.3f} "
+                        f"(target >= 0.80); examples={eval_metrics.get('_debug_bad_take_discard_examples', [])}"
+                    )
+                if math.isfinite(harmful) and harmful > 0.1:
+                    print(
+                        f"[warn baseline] high harmful_known_replace_rate={harmful:.3f} "
+                        f"(target <= 0.10); examples={eval_metrics.get('_debug_harmful_replace_examples', [])}"
+                    )
             bot_eval_dir = output_dir / "bot_eval"
             _ensure_dir(bot_eval_dir)
             with (bot_eval_dir / f"iter_{iteration:04d}.json").open("w", encoding="utf-8") as f:
@@ -835,6 +1182,8 @@ def main() -> None:
         history["loss_policy"].append(float(losses["loss_policy"]))
         history["loss_value"].append(float(losses["loss_value"]))
         history["loss_reward"].append(float(losses["loss_reward"]))
+        history["loss_winner"].append(float("nan"))
+        history["loss_rank"].append(float("nan"))
         history["grad_norm"].append(float(losses["grad_norm"]))
         history["replay_steps"].append(float(replay.total_steps()))
         history["selfplay_mean_steps"].append(float(mean(episode_lengths) if episode_lengths else 0.0))
@@ -867,6 +1216,12 @@ def main() -> None:
         history["selfplay_vs_checkpoint_fraction"].append(
             float(checkpoint_opponent_episodes / max(1, args.selfplay_episodes_per_iter))
         )
+        history["selfplay_curriculum_stage"].append(float(stage))
+        history["selfplay_curriculum_bot_fraction_target"].append(float(effective_bot_fraction))
+        history["selfplay_curriculum_anchor_met"].append(1.0 if anchor_met_iteration is not None else 0.0)
+        history["selfplay_curriculum_all_met"].append(1.0 if all_met_iteration is not None else 0.0)
+        history["winner_loss_weight"].append(float("nan"))
+        history["rank_loss_weight"].append(float("nan"))
         history["eval_mean_score_p0"].append(float(eval_metrics["eval_mean_score_p0"]))
         history["eval_mean_score_p1"].append(float(eval_metrics["eval_mean_score_p1"]))
         history["eval_mean_score_diff_p0_minus_p1"].append(float(eval_metrics["eval_mean_score_diff_p0_minus_p1"]))
@@ -878,10 +1233,26 @@ def main() -> None:
         history["eval_nontrunc_tie_rate"].append(float(eval_metrics["eval_nontrunc_tie_rate"]))
         history["eval_mean_episode_length"].append(float(eval_metrics["eval_mean_episode_length"]))
         history["eval_truncation_rate"].append(float(eval_metrics["eval_truncation_rate"]))
+        history["eval_take_discard_when_discard_le_0_rate"].append(
+            float(eval_metrics["eval_take_discard_when_discard_le_0_rate"])
+        )
+        history["eval_take_discard_when_discard_le_2_rate"].append(
+            float(eval_metrics["eval_take_discard_when_discard_le_2_rate"])
+        )
+        history["eval_keep_when_drawn_le_0_rate"].append(float(eval_metrics["eval_keep_when_drawn_le_0_rate"]))
+        history["eval_keep_when_drawn_le_2_rate"].append(float(eval_metrics["eval_keep_when_drawn_le_2_rate"]))
+        history["eval_replace_known_higher_when_keep_low_rate"].append(
+            float(eval_metrics["eval_replace_known_higher_when_keep_low_rate"])
+        )
+        history["eval_harmful_known_replace_rate"].append(float(eval_metrics["eval_harmful_known_replace_rate"]))
         history["eval_bots_mean_score_diff_p0_minus_p1"].append(
             float(eval_metrics["eval_bots_mean_score_diff_p0_minus_p1"])
         )
         history["eval_bots_win_rate_p0"].append(float(eval_metrics["eval_bots_win_rate_p0"]))
+        history["eval_value_mse"].append(float(eval_metrics.get("eval_value_mse", float("nan"))))
+        history["eval_value_mae"].append(float(eval_metrics.get("eval_value_mae", float("nan"))))
+        history["eval_value_pred_mean"].append(float(eval_metrics.get("eval_value_pred_mean", float("nan"))))
+        history["eval_value_target_mean"].append(float(eval_metrics.get("eval_value_target_mean", float("nan"))))
 
         _save_metrics(history, output_dir=output_dir)
         _save_graphs(history, graph_dir=graph_dir)

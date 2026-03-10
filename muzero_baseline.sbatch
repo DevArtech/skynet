@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=muzero_baseline
-#SBATCH --partition=teaching
+#SBATCH --partition=dgxh100
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=16
-#SBATCH --mem=256G
+#SBATCH --mem=128G
 #SBATCH --time=1-00:00:00
 #SBATCH --output=runs/muzero_baseline/muzero_baseline_%j.out
 #SBATCH --error=runs/muzero_baseline/muzero_baseline_%j.err
@@ -30,16 +30,23 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 "$PYTHON_BIN" -u -c "import torch; print('torch', torch.__version__); print('cuda available:', torch.cuda.is_available()); print('device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 EVAL_EPISODES=${EVAL_EPISODES:-40}
 SELFPLAY_EPISODES_PER_ITER=${SELFPLAY_EPISODES_PER_ITER:-8}
-SELFPLAY_SIMS=${SELFPLAY_SIMS:-64}
-EVAL_SIMS=${EVAL_SIMS:-64}
+SELFPLAY_SIMS=${SELFPLAY_SIMS:-200}
+SELFPLAY_SIMS_MID=${SELFPLAY_SIMS_MID:-400}
+SELFPLAY_SIMS_FINAL=${SELFPLAY_SIMS_FINAL:-600}
+SELFPLAY_SIMS_MID_ITER=${SELFPLAY_SIMS_MID_ITER:-300}
+SELFPLAY_SIMS_FINAL_ITER=${SELFPLAY_SIMS_FINAL_ITER:-900}
+EVAL_SIMS=${EVAL_SIMS:-800}
 EVAL_BOT_EPISODES_PER_BOT=${EVAL_BOT_EPISODES_PER_BOT:-20}
 MAX_MOVES_PER_EPISODE=${MAX_MOVES_PER_EPISODE:-800}
+TRAIN_STEPS_PER_ITER=${TRAIN_STEPS_PER_ITER:-96}
+UNROLL_STEPS=${UNROLL_STEPS:-8}
+VALUE_LOSS_WEIGHT=${VALUE_LOSS_WEIGHT:-1.5}
 DISCOUNT=${DISCOUNT:-0.997}
 TRUNCATION_PENALTY=${TRUNCATION_PENALTY:-1.0}
 TIME_PENALTY_PER_STEP=${TIME_PENALTY_PER_STEP:-0}
 TIME_PENALTY_MAX_PER_EPISODE=${TIME_PENALTY_MAX_PER_EPISODE:--1}
 OPPONENT_CHECKPOINT_FRACTION=${OPPONENT_CHECKPOINT_FRACTION:-0.2}
-HEURISTIC_BOT_FRACTION=${HEURISTIC_BOT_FRACTION:-0.3}
+HEURISTIC_BOT_FRACTION=${HEURISTIC_BOT_FRACTION:-0.6}
 HEURISTIC_BOT_NAMES=${HEURISTIC_BOT_NAMES:-greedy_value_replacement,information_first_flip,column_hunter,risk_aware_unknown_replacement,end_round_aggro,anti_discard}
 HEURISTIC_BOT_EPSILON=${HEURISTIC_BOT_EPSILON:-0.02}
 RESUME=${RESUME:-0}
@@ -65,8 +72,15 @@ TRAIN_ARGS=(
   --eval-episodes "$EVAL_EPISODES"
   --eval-bot-episodes-per-bot "$EVAL_BOT_EPISODES_PER_BOT"
   --eval-sims "$EVAL_SIMS"
+  --train-steps-per-iter "$TRAIN_STEPS_PER_ITER"
+  --unroll-steps "$UNROLL_STEPS"
+  --value-loss-weight "$VALUE_LOSS_WEIGHT"
   --selfplay-episodes-per-iter "$SELFPLAY_EPISODES_PER_ITER"
   --selfplay-sims "$SELFPLAY_SIMS"
+  --selfplay-sims-mid "$SELFPLAY_SIMS_MID"
+  --selfplay-sims-final "$SELFPLAY_SIMS_FINAL"
+  --selfplay-sims-mid-iter "$SELFPLAY_SIMS_MID_ITER"
+  --selfplay-sims-final-iter "$SELFPLAY_SIMS_FINAL_ITER"
   --discount "$DISCOUNT"
   --truncation-penalty "$TRUNCATION_PENALTY"
   --time-penalty-per-step "$TIME_PENALTY_PER_STEP"

@@ -32,6 +32,7 @@ class MuZeroTrainConfig:
     time_penalty_per_step: float = 0.0
     time_penalty_max_per_episode: float | None = None
     truncation_penalty: float = 1.0
+    phase_stratify_prob: float = 0.3
     device: str = "cpu"
 
 
@@ -44,12 +45,42 @@ class StepRecord:
     root_value: float
     current_player_id: int
     final_score_utility: float
+    decision_phase_id: int = 0
 
 
 @dataclass
 class EpisodeRecord:
     steps: list[StepRecord]
     terminated: bool
+
+
+def _compute_n_step_return(
+    steps: list[StepRecord],
+    start_idx: int,
+    td_steps: int,
+    discount: float,
+) -> float:
+    """
+    Standard MuZero n-step bootstrapped return:
+      z_t = Σ_{i=0}^{td_steps-1} γ^i * r_{t+i}  +  γ^{td_steps} * v_{t+td_steps}
+
+    r_{t+i} = steps[t+i].reward (actual env reward after that step's action).
+    Bootstrap value = steps[t+td_steps].root_value (MCTS estimate).
+    When the episode ends before td_steps steps are available, no bootstrap is
+    added (value at a terminal state is 0).
+    """
+    accum = 0.0
+    gamma_pow = 1.0
+    for i in range(td_steps):
+        t = start_idx + i
+        if t >= len(steps):
+            break
+        accum += gamma_pow * steps[t].reward
+        gamma_pow *= discount
+    bootstrap_idx = start_idx + td_steps
+    if bootstrap_idx < len(steps):
+        accum += gamma_pow * steps[bootstrap_idx].root_value
+    return accum
 
 
 class ReplayBuffer:
@@ -74,6 +105,7 @@ class ReplayBuffer:
         td_steps: int,
         discount: float,
         action_space_size: int,
+        phase_stratify_prob: float = 0.0,
     ) -> dict[str, Any]:
         if not self.episodes:
             raise ValueError("Replay buffer is empty.")
@@ -82,10 +114,20 @@ class ReplayBuffer:
         if not valid_episodes:
             raise ValueError("Replay buffer has no non-empty episodes.")
 
+        # CHOOSE_SOURCE=1 and KEEP_OR_DISCARD=2 are the two decision gates.
+        _PRIORITY_PHASES = {1, 2}
+
         samples: list[tuple[EpisodeRecord, int]] = []
         for _ in range(batch_size):
             episode = random.choice(valid_episodes)
-            start_idx = random.randrange(len(episode.steps))
+            if phase_stratify_prob > 0.0 and random.random() < phase_stratify_prob:
+                priority_indices = [
+                    i for i, s in enumerate(episode.steps)
+                    if s.decision_phase_id in _PRIORITY_PHASES
+                ]
+                start_idx = random.choice(priority_indices) if priority_indices else random.randrange(len(episode.steps))
+            else:
+                start_idx = random.randrange(len(episode.steps))
             samples.append((episode, start_idx))
 
         observations: list[dict[str, Any]] = []
@@ -107,7 +149,7 @@ class ReplayBuffer:
 
                 step = episode.steps[idx]
                 target_policy[b, k] = torch.tensor(step.policy_target, dtype=torch.float32)
-                target_value[b, k] = float(step.final_score_utility)
+                target_value[b, k] = float(_compute_n_step_return(episode.steps, idx, td_steps, discount))
                 policy_mask[b, k] = 1.0
                 value_mask[b, k] = 1.0
 
@@ -206,8 +248,8 @@ def generate_self_play_episode(
         if time_penalty_max_per_episode is not None and time_penalty_max_per_episode >= 0.0:
             penalty = min(penalty, max(0.0, float(time_penalty_max_per_episode) - penalty_accum))
         penalty_accum += penalty
-        _ = rewards  # Environment rewards are ignored; value target is terminal score utility.
-        reward = -penalty
+        env_reward_for_actor = float(rewards.get(f"player_{actor}", 0.0))
+        reward = env_reward_for_actor - penalty
 
         steps.append(
             StepRecord(
@@ -218,6 +260,7 @@ def generate_self_play_episode(
                 root_value=root_value,
                 current_player_id=int(actor),
                 final_score_utility=0.0,
+                decision_phase_id=int(observation.get("decision_phase_id", 0)),
             )
         )
 
@@ -264,6 +307,7 @@ def train_step(
         td_steps=config.td_steps,
         discount=config.discount,
         action_space_size=model.config.action_space_size,
+        phase_stratify_prob=config.phase_stratify_prob,
     )
     device = torch.device(config.device)
     obs_tokens = observation_batch_to_tensors(

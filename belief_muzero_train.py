@@ -20,6 +20,7 @@ from skyjo_env import SkyjoEnv
 class BeliefTrainConfig:
     unroll_steps: int = 5
     discount: float = 1.0
+    td_steps: int = 10
     replay_capacity_episodes: int = 1000
     batch_size: int = 64
     max_moves_per_episode: int = 2000
@@ -33,6 +34,7 @@ class BeliefTrainConfig:
     rank_loss_weight: float = 0.1
     time_penalty_per_step: float = 0.0
     time_penalty_max_per_episode: float | None = None
+    phase_stratify_prob: float = 0.3
     device: str = "cpu"
 
 
@@ -48,6 +50,7 @@ class BeliefStepRecord:
     winner_id: int
     final_ranks: list[int]
     final_score_utility: float
+    decision_phase_id: int = 0
 
 
 @dataclass
@@ -80,6 +83,35 @@ def _compute_ranks(scores: list[int]) -> list[int]:
     return [score_to_rank[s] for s in scores]
 
 
+def _compute_n_step_return(
+    steps: list[BeliefStepRecord],
+    start_idx: int,
+    td_steps: int,
+    discount: float,
+) -> float:
+    """
+    Standard MuZero n-step bootstrapped return:
+      z_t = Σ_{i=0}^{td_steps-1} γ^i * r_{t+i}  +  γ^{td_steps} * v_{t+td_steps}
+
+    r_{t+i} = steps[t+i].reward (actual env reward after that step's action).
+    Bootstrap value = steps[t+td_steps].root_value (MCTS estimate).
+    When the episode ends before td_steps steps are available, no bootstrap is
+    added (value at a terminal state is 0).
+    """
+    accum = 0.0
+    gamma_pow = 1.0
+    for i in range(td_steps):
+        t = start_idx + i
+        if t >= len(steps):
+            break
+        accum += gamma_pow * steps[t].reward
+        gamma_pow *= discount
+    bootstrap_idx = start_idx + td_steps
+    if bootstrap_idx < len(steps):
+        accum += gamma_pow * steps[bootstrap_idx].root_value
+    return accum
+
+
 class BeliefReplayBuffer:
     def __init__(self, capacity_episodes: int) -> None:
         self.episodes: deque[BeliefEpisodeRecord] = deque(maxlen=capacity_episodes)
@@ -100,15 +132,30 @@ class BeliefReplayBuffer:
         unroll_steps: int,
         action_space_size: int,
         max_players: int,
+        td_steps: int = 10,
+        discount: float = 1.0,
+        phase_stratify_prob: float = 0.0,
     ) -> dict[str, Any]:
         valid_episodes = [ep for ep in self.episodes if ep.steps]
         if not valid_episodes:
             raise ValueError("Belief replay buffer is empty.")
 
+        # CHOOSE_SOURCE=1 and KEEP_OR_DISCARD=2 are the two "gate" decisions.
+        # Sampling from them more often gives more training signal to the
+        # policy/value heads that drive the fundamentals metrics.
+        _PRIORITY_PHASES = {1, 2}
+
         samples: list[tuple[BeliefEpisodeRecord, int]] = []
         for _ in range(batch_size):
             ep = random.choice(valid_episodes)
-            start = random.randrange(len(ep.steps))
+            if phase_stratify_prob > 0.0 and random.random() < phase_stratify_prob:
+                priority_indices = [
+                    i for i, s in enumerate(ep.steps)
+                    if s.decision_phase_id in _PRIORITY_PHASES
+                ]
+                start = random.choice(priority_indices) if priority_indices else random.randrange(len(ep.steps))
+            else:
+                start = random.randrange(len(ep.steps))
             samples.append((ep, start))
 
         observations: list[dict[str, Any]] = []
@@ -138,7 +185,7 @@ class BeliefReplayBuffer:
                 rk = int(step.final_ranks[cp] if cp < len(step.final_ranks) else max_players)
 
                 target_policy[b, k] = torch.tensor(step.policy_target, dtype=torch.float32)
-                target_value[b, k] = float(step.final_score_utility)
+                target_value[b, k] = float(_compute_n_step_return(episode.steps, idx, td_steps, discount))
                 winner_id[b, k] = max(0, min(max_players - 1, wr))
                 ego_rank[b, k] = max(1, min(max_players, rk))
                 current_player[b, k] = max(0, min(max_players - 1, cp))
@@ -228,15 +275,17 @@ def generate_belief_self_play_episode(
         if time_penalty_max_per_episode is not None and time_penalty_max_per_episode >= 0.0:
             penalty = min(penalty, max(0.0, float(time_penalty_max_per_episode) - penalty_accum))
         penalty_accum += penalty
+        env_reward_for_actor = float(rewards.get(f"player_{actor}", 0.0))
         pending_steps.append(
             {
                 "observation": copy.deepcopy(obs),
                 "action": chosen_action,
-                "reward": -penalty,
+                "reward": env_reward_for_actor - penalty,
                 "policy_target": policy_target,
                 "root_value": root_value,
                 "current_player_id": actor,
                 "num_players": env.num_players,
+                "decision_phase_id": int(obs.get("decision_phase_id", 0)),
             }
         )
         obs = next_obs
@@ -266,6 +315,7 @@ def generate_belief_self_play_episode(
                 winner_id=winner_id,
                 final_ranks=final_ranks,
                 final_score_utility=opp_mean - own,
+                decision_phase_id=int(s.get("decision_phase_id", 0)),
             )
         )
     return BeliefEpisodeRecord(steps=steps, terminated=terminated)
@@ -291,6 +341,9 @@ def train_belief_step(
         unroll_steps=config.unroll_steps,
         action_space_size=model.config.action_space_size,
         max_players=model.config.max_players,
+        td_steps=config.td_steps,
+        discount=config.discount,
+        phase_stratify_prob=config.phase_stratify_prob,
     )
 
     obs_tokens = observation_batch_to_tensors(
