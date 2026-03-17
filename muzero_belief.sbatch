@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=muzero_belief
-#SBATCH --partition=dgxh100
+#SBATCH --partition=dgx
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-gpu=16
 #SBATCH --mem=256G
