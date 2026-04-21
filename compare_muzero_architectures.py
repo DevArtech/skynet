@@ -8,7 +8,7 @@ from pathlib import Path
 import matplotlib
 import torch
 
-from belief_muzero_mcts import run_belief_mcts
+from belief_muzero_mcts import ABLATION_NO_CONDITIONING, run_belief_mcts
 from belief_muzero_model import BeliefAwareMuZeroNet, build_default_belief_muzero_config
 from muzero_mcts import MCTSConfig, run_mcts
 from muzero_model import MuZeroNet, build_default_skyjo_muzero_config
@@ -53,6 +53,7 @@ def _select_action(
     cfg: MCTSConfig,
     ablate_belief_head: bool,
     device: str,
+    ablation_mode: str | None = None,
 ) -> int:
     if policy_name == "baseline":
         if baseline is None:
@@ -72,7 +73,7 @@ def _select_action(
             legal_action_ids=legal_actions,
             ego_player_id=current_player,
             config=cfg,
-            ablate_belief_head=True,
+            ablation_mode=ABLATION_NO_CONDITIONING,
             device=device,
         )
         return int(stats.action)
@@ -84,6 +85,7 @@ def _select_action(
         ego_player_id=current_player,
         config=cfg,
         ablate_belief_head=ablate_belief_head,
+        ablation_mode=ablation_mode,
         device=device,
     )
     return int(stats.action)

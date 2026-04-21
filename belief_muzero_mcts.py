@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -7,9 +8,57 @@ from typing import Any
 import torch
 
 from belief_muzero_model import BeliefAwareMuZeroNet
-from muzero_mcts import MCTSConfig, SearchStats
+from muzero_mcts import MCTSConfig, SearchStats, eval_mcts_inference_autocast
 from muzero_model import observation_batch_to_tensors
 from skyjo_decision_env import DecisionAction, DecisionPhase
+
+ABLATION_FULL = "full"
+ABLATION_NO_CONDITIONING = "no_conditioning"
+ABLATION_ZERO_EGO = "zero_ego"
+ABLATION_WRONG_EGO = "wrong_ego"
+ABLATION_EGO_ONLY = "ego_only"
+
+VALID_ABLATION_MODES = frozenset(
+    {ABLATION_FULL, ABLATION_NO_CONDITIONING, ABLATION_ZERO_EGO, ABLATION_WRONG_EGO, ABLATION_EGO_ONLY}
+)
+
+
+def _apply_ablation_conditioning(
+    model: BeliefAwareMuZeroNet,
+    hidden_state: torch.Tensor,
+    ego_tensor: torch.Tensor,
+    cur_tensor: torch.Tensor,
+    nplayers_tensor: torch.Tensor,
+    ablation_mode: str,
+    num_players: int,
+) -> torch.Tensor:
+    """Apply conditioning to *hidden_state* according to the requested ablation mode."""
+    if ablation_mode == ABLATION_NO_CONDITIONING:
+        return hidden_state
+
+    if ablation_mode == ABLATION_FULL:
+        return model._condition_hidden(hidden_state, ego_tensor, cur_tensor, nplayers_tensor)
+
+    ego = ego_tensor.long().clamp(0, model.config.max_players)
+    current = cur_tensor.long().clamp(0, model.config.max_players)
+    nplayers = nplayers_tensor.long().clamp(1, model.config.max_players)
+
+    if ablation_mode == ABLATION_ZERO_EGO:
+        conditioned = hidden_state + model.current_player_emb(current) + model.num_players_emb(nplayers)
+    elif ablation_mode == ABLATION_WRONG_EGO:
+        wrong_ego = ((ego_tensor + 1) % max(1, num_players)).long().clamp(0, model.config.max_players)
+        conditioned = (
+            hidden_state
+            + model.ego_player_emb(wrong_ego)
+            + model.current_player_emb(current)
+            + model.num_players_emb(nplayers)
+        )
+    elif ablation_mode == ABLATION_EGO_ONLY:
+        conditioned = hidden_state + model.ego_player_emb(ego)
+    else:
+        raise ValueError(f"Unknown ablation_mode={ablation_mode!r}. Valid: {VALID_ABLATION_MODES}")
+
+    return model.condition_norm(conditioned)
 
 
 @dataclass
@@ -155,11 +204,21 @@ def run_belief_mcts(
     ego_player_id: int,
     config: MCTSConfig | None = None,
     ablate_belief_head: bool = False,
+    ablation_mode: str | None = None,
     device: str | torch.device = "cpu",
+    *,
+    mcts_inference_autocast: bool = False,
 ) -> SearchStats:
     cfg = config or MCTSConfig()
     dev = torch.device(device)
     model = model.to(dev)
+
+    if ablation_mode is not None:
+        mode = ablation_mode
+    elif ablate_belief_head:
+        mode = ABLATION_NO_CONDITIONING
+    else:
+        mode = ABLATION_FULL
 
     action_space_size = model.config.action_space_size
     legal_actions = _legal_actions_for_model(legal_action_ids, action_space_size)
@@ -185,18 +244,19 @@ def run_belief_mcts(
     cur_tensor = torch.tensor([current_player_id], dtype=torch.long, device=dev)
     nplayers_tensor = torch.tensor([num_players], dtype=torch.long, device=dev)
 
+    def _infer_autocast():
+        return eval_mcts_inference_autocast(dev) if mcts_inference_autocast else contextlib.nullcontext()
+
     with torch.no_grad():
-        if ablate_belief_head:
+        with _infer_autocast():
             hidden_state = model.representation(obs_tokens)
             root.hidden_state = hidden_state[0]
-            root_policy_logits, root_value_logits, _, _ = model.prediction(hidden_state)
+            conditioned = _apply_ablation_conditioning(
+                model, hidden_state, ego_tensor, cur_tensor, nplayers_tensor, mode, num_players
+            )
+            root_policy_logits, root_value_logits, _, _ = model.prediction(conditioned)
             root_value = model.value_support.logits_to_scalar(root_value_logits[0]).item()
             root_logits = root_policy_logits[0]
-        else:
-            initial = model.initial_inference(obs_tokens, ego_tensor, cur_tensor, nplayers_tensor)
-            root.hidden_state = initial.hidden_state[0]
-            root_value = model.value_support.logits_to_scalar(initial.value_logits[0]).item()
-            root_logits = initial.policy_logits[0]
 
     mask = torch.zeros_like(root_logits)
     mask[legal_actions] = 1.0
@@ -234,23 +294,18 @@ def run_belief_mcts(
                 a = torch.tensor([chosen_action], dtype=torch.long, device=dev)
                 cur = torch.tensor([next_player_id], dtype=torch.long, device=dev)
                 with torch.no_grad():
-                    if ablate_belief_head:
+                    with _infer_autocast():
                         next_hidden_state, reward_logits = model.dynamics(parent.hidden_state.unsqueeze(0), a)
-                        policy_logits, value_logits, _, _ = model.prediction(next_hidden_state)
+                        conditioned = _apply_ablation_conditioning(
+                            model, next_hidden_state, ego_tensor, cur, nplayers_tensor, mode, num_players
+                        )
+                        policy_logits, value_logits, _, _ = model.prediction(conditioned)
                         node.hidden_state = next_hidden_state[0]
                         node.current_player_id = next_player_id
                         node.decision_phase_id = next_phase_id
                         node.reward = model.reward_support.logits_to_scalar(reward_logits[0]).item()
                         value = model.value_support.logits_to_scalar(value_logits[0]).item()
                         probs = torch.softmax(policy_logits[0], dim=-1)
-                    else:
-                        rec = model.recurrent_inference(parent.hidden_state.unsqueeze(0), a, ego_tensor, cur, nplayers_tensor)
-                        node.hidden_state = rec.hidden_state[0]
-                        node.current_player_id = next_player_id
-                        node.decision_phase_id = next_phase_id
-                        node.reward = model.reward_support.logits_to_scalar(rec.reward_logits[0]).item()
-                        value = model.value_support.logits_to_scalar(rec.value_logits[0]).item()
-                        probs = torch.softmax(rec.policy_logits[0], dim=-1)
                 legal_actions = _phase_legal_actions(next_phase_id, action_space_size)
                 for action_id in legal_actions:
                     node.children[action_id] = _Node(

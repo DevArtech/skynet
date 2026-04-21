@@ -194,9 +194,9 @@ def run_linear_probes(
 
     x = np.arange(len(feat_names))
     width = 0.25
-    ax.bar(x - width, bl_scores, width, label="Baseline", color="#4C72B0")
+    ax.bar(x - width, bl_scores, width, label="Baseline", color="#C44E52")
     ax.bar(x, bf_scores, width, label="Belief (raw)", color="#55A868")
-    ax.bar(x + width, bf_cond_scores, width, label="Belief (ego-cond)", color="#C44E52")
+    ax.bar(x + width, bf_cond_scores, width, label="Belief (ego-cond)", color="#4C72B0")
     ax.set_ylabel("Linear Probe R²", fontsize=12)
     ax.set_title("How Much Hidden-State Info Is Linearly Decodable from Latent Vectors?", fontsize=14)
     ax.set_xticks(x)

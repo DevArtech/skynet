@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 from dataclasses import dataclass, field
@@ -9,6 +10,14 @@ import torch
 
 from muzero_model import MuZeroNet, observation_batch_to_tensors
 from skyjo_decision_env import DecisionAction, DecisionPhase
+
+
+def eval_mcts_inference_autocast(device: torch.device | str) -> contextlib.AbstractContextManager[None]:
+    """Use fp16 autocast on CUDA during MCTS inference (eval-friendly, avoids model.half())."""
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
 
 
 @dataclass(frozen=True)
@@ -112,10 +121,13 @@ def _expand_root(
     observation: dict[str, Any],
     legal_actions: list[int],
     device: torch.device,
+    use_inference_autocast: bool = False,
 ) -> float:
     tokens = observation_batch_to_tensors([observation], history_length=model.config.history_length, device=device)
+    infer_ctx = eval_mcts_inference_autocast(device) if use_inference_autocast else contextlib.nullcontext()
     with torch.no_grad():
-        initial = model.initial_inference(tokens)
+        with infer_ctx:
+            initial = model.initial_inference(tokens)
         policy_logits = initial.policy_logits[0]
         value = model.value_support.logits_to_scalar(initial.value_logits[0]).item()
 
@@ -170,13 +182,22 @@ def _select_child(node: Node, min_max_stats: MinMaxStats, cfg: MCTSConfig) -> tu
     return best_action, best_child
 
 
-def _expand_with_model(parent: Node, node: Node, action: int, model: MuZeroNet) -> float:
+def _expand_with_model(
+    parent: Node,
+    node: Node,
+    action: int,
+    model: MuZeroNet,
+    use_inference_autocast: bool = False,
+) -> float:
     if parent.hidden_state is None:
         raise RuntimeError("Parent node hidden_state is missing.")
 
     action_tensor = torch.tensor([action], device=parent.hidden_state.device, dtype=torch.long)
+    infer_dev = parent.hidden_state.device
+    infer_ctx = eval_mcts_inference_autocast(infer_dev) if use_inference_autocast else contextlib.nullcontext()
     with torch.no_grad():
-        recurrent = model.recurrent_inference(parent.hidden_state.unsqueeze(0), action_tensor)
+        with infer_ctx:
+            recurrent = model.recurrent_inference(parent.hidden_state.unsqueeze(0), action_tensor)
         next_state = recurrent.hidden_state[0]
         reward = model.reward_support.logits_to_scalar(recurrent.reward_logits[0]).item()
         policy_logits = recurrent.policy_logits[0]
@@ -248,6 +269,8 @@ def run_mcts(
     legal_action_ids: list[int],
     config: MCTSConfig | None = None,
     device: torch.device | str = "cpu",
+    *,
+    mcts_inference_autocast: bool = False,
 ) -> SearchStats:
     cfg = config or MCTSConfig()
     dev = torch.device(device)
@@ -271,7 +294,9 @@ def run_mcts(
     phase_id = observation.get("decision_phase_id")
     if isinstance(phase_id, int):
         root.decision_phase_id = phase_id
-    root_value = _expand_root(root, model, observation, legal_actions, dev)
+    root_value = _expand_root(
+        root, model, observation, legal_actions, dev, use_inference_autocast=mcts_inference_autocast
+    )
     _add_root_dirichlet_noise(root, legal_actions, cfg)
 
     min_max_stats = MinMaxStats()
@@ -284,7 +309,13 @@ def run_mcts(
             search_path.append(node)
             if node.visit_count == 0:
                 parent = search_path[-2]
-                leaf_value = _expand_with_model(parent=parent, node=node, action=action, model=model)
+                leaf_value = _expand_with_model(
+                    parent=parent,
+                    node=node,
+                    action=action,
+                    model=model,
+                    use_inference_autocast=mcts_inference_autocast,
+                )
                 break
         else:
             # Not expected for root in this setup, but keep safe fallback.

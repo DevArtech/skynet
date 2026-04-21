@@ -358,6 +358,7 @@ def evaluate_model(
                 legal_action_ids=legal_actions,
                 config=eval_cfg,
                 device=device,
+                mcts_inference_autocast=True,
             )
             action = int(stats.action)
             if env_mode == "decision":
@@ -587,6 +588,7 @@ def evaluate_model_vs_heuristic_bots(
                         legal_action_ids=legal,
                         config=cfg,
                         device=device,
+                        mcts_inference_autocast=True,
                     )
                     action = int(stats.action)
                 else:
@@ -767,13 +769,24 @@ def main() -> None:
     parser.add_argument("--train-steps-per-iter", type=int, default=96)
     parser.add_argument("--eval-every", type=int, default=20)
     parser.add_argument("--eval-episodes", type=int, default=200)
-    parser.add_argument("--eval-bot-episodes-per-bot", type=int, default=20)
+    parser.add_argument("--eval-bot-episodes-per-bot", type=int, default=30)
     parser.add_argument("--selfplay-sims", type=int, default=200)
     parser.add_argument("--selfplay-sims-mid", type=int, default=400)
     parser.add_argument("--selfplay-sims-final", type=int, default=600)
     parser.add_argument("--selfplay-sims-mid-iter", type=int, default=300)
     parser.add_argument("--selfplay-sims-final-iter", type=int, default=900)
-    parser.add_argument("--eval-sims", type=int, default=800)
+    parser.add_argument(
+        "--eval-sims",
+        type=int,
+        default=200,
+        help="MCTS simulations per move during self-play evaluation.",
+    )
+    parser.add_argument(
+        "--eval-bot-sims",
+        type=int,
+        default=None,
+        help="MCTS simulations during heuristic-bot eval; defaults to --eval-sims if unset.",
+    )
     parser.add_argument("--dirichlet-alpha-initial", type=float, default=0.3)
     parser.add_argument("--dirichlet-frac-initial", type=float, default=0.25)
     parser.add_argument("--dirichlet-alpha-late", type=float, default=0.15)
@@ -1130,11 +1143,12 @@ def main() -> None:
                 seed_base=args.seed * 1000 + iteration * 100,
                 env_mode=args.env_mode,
             )
+            bot_sims = args.eval_bot_sims if args.eval_bot_sims is not None else args.eval_sims
             bot_overall, bot_detail = evaluate_model_vs_heuristic_bots(
                 model=model,
                 bot_names=bot_names,
                 episodes_per_bot=args.eval_bot_episodes_per_bot,
-                num_simulations=args.eval_sims,
+                num_simulations=bot_sims,
                 max_moves=args.eval_max_moves,
                 discount=args.discount,
                 device=args.device,
