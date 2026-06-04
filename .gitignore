@@ -1,4 +1,14 @@
-runs/
+runs/*
+!runs/muzero_baseline/
+runs/muzero_baseline/*
+!runs/muzero_baseline/checkpoints/
+runs/muzero_baseline/checkpoints/*
+!runs/muzero_baseline/checkpoints/checkpoint.pt
+!runs/muzero_belief/
+runs/muzero_belief/*
+!runs/muzero_belief/checkpoints/
+runs/muzero_belief/checkpoints/*
+!runs/muzero_belief/checkpoints/checkpoint.pt
 __pycache__/
 SKYNET.md
 learnings/
