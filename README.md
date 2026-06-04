@@ -55,6 +55,32 @@ npm run dev
 
 See `web/README.md` for API details, checkpoint selection, and smoke tests.
 
+## Pretrained checkpoints
+
+This repo ships two trained checkpoints so you can try the bot in the web UI without
+training from scratch:
+
+- `runs/muzero_baseline/checkpoints/checkpoint.pt` — classical MuZero baseline
+- `runs/muzero_belief/checkpoints/checkpoint.pt` — belief-aware MuZero (stronger of the two)
+
+Because these files are a few hundred MB each, they are stored with
+[Git LFS](https://git-lfs.github.com). You need Git LFS installed to get the real
+weights; without it you'll only see small pointer files.
+
+```bash
+# one-time setup
+git lfs install
+
+# fresh clone pulls the checkpoints automatically
+git clone https://github.com/DevArtech/skynet.git
+
+# or, in an existing checkout:
+git lfs pull
+```
+
+Everything else under `runs/` is gitignored — only these two checkpoints are tracked.
+New `*.pt` files are routed through Git LFS automatically (see `.gitattributes`).
+
 ## MuZero Training
 
 This repo includes two trainable architectures:
